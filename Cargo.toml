@@ -6,8 +6,12 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+chrono = "0.4.38"
 error = "0.1.9"
 ordered-float = "4.2.2"
-serde = { version = "1.0.207", features = ["derive"] }
+polars = "0.42.0"
+rayon = "1.10.0"
+serde = { version = "1.0.207", features = ["derive","rc"] }
 serde_json = "1.0.124"
 skiplist = "0.5.1"
+thiserror = "1.0.63"

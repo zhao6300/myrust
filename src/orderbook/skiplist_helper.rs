@@ -15,7 +15,7 @@ pub mod skiplist_serde {
         let mut ser_map = serializer.serialize_map(Some(skip_map.len()))?;
         for (key, value) in skip_map.iter() {
             ser_map.serialize_key(&key)?;
-            ser_map.serialize_value(value);
+            ser_map.serialize_value(&value)?;
         }
         ser_map.end()
     }

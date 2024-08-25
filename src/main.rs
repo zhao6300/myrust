@@ -1,6 +1,7 @@
 #![allow(unused_variables)]
 mod orderbook;
 use std::cmp::Reverse;
+use std::collections::VecDeque;
 use std::process::Output;
 use std::{cell::RefCell, io};
 
@@ -182,7 +183,14 @@ enum List {
     Nil,
 }
 
-use orderbook::types::Side;
+use orderbook::order::Order;
+use orderbook::order::OrderRef;
+use orderbook::types::OrderSourceType;
+use orderbook::types::{OrdType, Side};
+use orderbook::L3Order;
+use orderbook::L3OrderRef;
+use rayon::range;
+use serde::de::{self, value};
 
 use crate::List::{Cons, Nil};
 use std::rc::Rc;
@@ -509,6 +517,8 @@ fn macro_test() {
 
 fn skip_list_test() {
     use orderbook::skiplist_helper::skiplist_serde;
+    use orderbook::skiplist_orderbook::PriceLevel;
+    use orderbook::{L3Order, L3OrderRef};
     use ordered_float::OrderedFloat;
     use serde;
     use serde::{Deserialize, Serialize};
@@ -516,8 +526,8 @@ fn skip_list_test() {
     use skiplist::SkipMap;
     use std::cmp::{Ord, Ordering};
     use std::collections::LinkedList;
+    use std::collections::VecDeque;
     use std::error::Error;
-
     #[derive(Serialize, Deserialize, Debug)]
     struct Order {
         pub price: i64,
@@ -626,11 +636,64 @@ fn skip_list_test() {
         // print!("{:p}\n", &order);
         bucket2.add_order(order2);
     }
+
+    let mut map2: SkipMap<i64, i64> = SkipMap::new();
+    for i in 1..=10 {
+        map2.insert(i, i + 10);
+    }
+
+    
+    for (k, v) in &mut map2 {
+        print!("k = {}, v = {}\n", k, v);
+    }
+
     // t1(&mut map);
+    // loop {
+    //     let item = map.front();
+    //     match item {
+    //         Some((key, value)) => {
+    //             map.pop_front();
+    //         }
+    //         None => {
+    //             break;
+    //         }
+    //     }
+    // }
+    // print!("map = {:?}\n", map);
+    // t1(&mut map);
+    // print!("{:?}\n", map.get(&123).unwrap().get_front().unwrap());
     // let serialized_order_book = serde_json::to_string(&order_book).unwrap();
     // println!("serialized_bucket = {:?}", serialized_order_book);
     // let new_order_book: OrderBook = serde_json::from_str(&serialized_order_book).unwrap();
     // print!("new_order_book = {:?}", new_order_book);
+
+    // let mut price_level = PriceLevel::new();
+
+    // for i in 1..=5 {
+    //     let order = L3Order::new_ref(i, Side::Buy, 100, 100.0, 100);
+    //     price_level.add_order(order.clone());
+    // }
+    // let orders = &price_level.orders;
+    // // let iter = orders.iter().next().unwrap();
+    // print!("len = {}, {:?}\n", orders.len(), orders);
+
+    // let order = L3Order::new_ref(100, Side::Buy, 100, 100.0, 100);
+    // price_level.add_order(order.clone());
+    // print!("order = {:?}\n", order);
+
+    // let mut deque: VecDeque<Option<L3OrderRef>> = VecDeque::new();
+    // for i in 1..5 {
+    //     let order = L3Order::new_ref(i, Side::Buy, 100, 100.0, 100);
+    //     deque.push_back(Some(order.clone()));
+    // }
+    // deque[2] = None;
+    // deque.clear();
+    // print!("length = {}, {:?}\n", deque.len(), deque);
+    // let serialized_deque = serde_json::to_string(&deque).unwrap();
+    // print!("{:?}\n", serialized_deque);
+
+    // let serialized_price_level = serde_json::to_string(&price_level).unwrap();
+    // print!("{:?}\n", serialized_price_level);
 
     // let p1 = Price::new(1.0, Some(true));
     // let p2 = Price::new(2.0, Some(true));
@@ -641,19 +704,19 @@ fn skip_list_test() {
     //     drop(p1);
     //     print!("{:?},{}\n", p2, Rc::strong_count(&p2));
     // }
-    {
-        let p1 = RefCell::new(Price::new(1.0, Some(true)));
-        let p2 = p1.borrow();
-        let p3 = p1.borrow();
-        print!("{:?}, \n", p1);
-    }
-    {
-        let p1 = Rc::new(RefCell::new(Price::new(1.0, Some(true))));
-        let p2 = p1.clone();
-        print!("{:?}, {}\n", p2, Rc::strong_count(&p1));
-        let p3 = p2.borrow();
-        let p4 = p1.borrow();
-    }
+    // {
+    //     let p1 = RefCell::new(Price::new(1.0, Some(true)));
+    //     let p2 = p1.borrow();
+    //     let p3 = p1.borrow();
+    //     print!("{:?}, \n", p1);
+    // }
+    // {
+    //     let p1 = Rc::new(RefCell::new(Price::new(1.0, Some(true))));
+    //     let p2 = p1.clone();
+    //     print!("{:?}, {}\n", p2, Rc::strong_count(&p1));
+    //     let p3 = p2.borrow();
+    //     let p4 = p1.borrow();
+    // }
     // *p1.price = 2.0;
     // print!("{:?}",p2);
 
@@ -681,6 +744,58 @@ fn skip_list_test() {
     // println!("serialized_bucket = {:?}", serialized_bucket);
 }
 
+fn float_test() {
+    use orderbook::types::{OrdType, Side};
+    let price: f64 = 1.253;
+    let tick_size = 0.001;
+    let price_tick: i64 = (price / tick_size).round() as i64;
+    print!("price_tick = {}\n", price_tick);
+
+    let order = Order::new_ref(
+        Some("user".to_string()),
+        "stock_code".to_string(),
+        123,
+        100.0,
+        100.0,
+        "s",
+        OrdType::L,
+        Some(OrderSourceType::UserOrder),
+    );
+    fn process_order(order: OrderRef) {
+        let order2 = order.clone();
+        let order3 = &order;
+        // let mut o = RefCell::borrow_mut(&order);
+        {
+            let mut o = RefCell::borrow_mut(order3);
+            o.price = 1000.1123;
+        }
+        print!(
+            "refcount = {}, {:?}\n",
+            Rc::strong_count(&order2),
+            order2.borrow()
+        );
+    }
+
+    // process_order(order);
+    let mut queue: VecDeque<Option<i64>> = VecDeque::new();
+    for i in 1..=3 {
+        if i == 2 {
+            queue.push_back(None);
+        } else {
+            queue.push_back(Some(i));
+        }
+    }
+
+    let iter = queue.iter_mut();
+    for idx in 0..queue.len() {
+        match &queue[idx] {
+            Some(value) => print!("{:?},", queue[idx]),
+            None => continue,
+        }
+    }
+    print!("\n");
+}
+
 fn main() {
     // test1();
     // loop_test();
@@ -699,4 +814,5 @@ fn main() {
     // array_test();
     // macro_test();
     skip_list_test();
+    // float_test();
 }
