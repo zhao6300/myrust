@@ -1,17 +1,23 @@
 use super::*;
-
-pub struct DataCollator {}
+#[derive(Debug)]
+pub struct DataCollator {
+    is_last: bool,
+}
 
 impl DataCollator {
     pub fn new() -> Self {
-        Self {}
+        Self { is_last: true }
     }
 }
 
 impl OrderIter for DataCollator {
-    type Item = L3OrderRef;
+    type Item = OrderRef;
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn next(&self) -> Option<&Self::Item> {
         None
+    }
+
+    fn is_last(&self) -> bool {
+        self.is_last
     }
 }

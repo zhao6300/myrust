@@ -1,9 +1,10 @@
-use super::{OrdType, OrderSourceType, Side, Status, OrderId};
+use super::{OrdType, OrderId, OrderSourceType, Side, Status};
 use serde::{Deserialize, Serialize};
+use std::cmp::{Ord, Ordering};
 use std::str::FromStr;
 use std::{cell::RefCell, rc::Rc};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Order {
     pub order_id: OrderId,
     pub stock_code: String,
@@ -17,9 +18,10 @@ pub struct Order {
     pub order_type: OrdType,
     pub side: Side,
     pub status: Status,
-    pub source: Option<OrderSourceType>,
+    pub source: OrderSourceType,
     pub recv_num: i64,
     pub account: Option<String>,
+    pub seq: i64,
 
     /// 和盘口成交的数量
     pub filled_qty: f64,
@@ -36,7 +38,7 @@ impl Order {
         side: Side,
         order_type: OrdType,
         timestamp: i64,
-        source: Option<OrderSourceType>,
+        source: OrderSourceType,
     ) -> Self {
         Self {
             local_time: timestamp,
@@ -54,6 +56,7 @@ impl Order {
             account: account,
             filled_qty: 0.0,
             left_qty: qty,
+            seq: 0,
         }
     }
 
@@ -65,7 +68,7 @@ impl Order {
         qty: f64,
         bs_flag: &str,
         order_type: OrdType,
-        source: Option<OrderSourceType>,
+        source: OrderSourceType,
     ) -> OrderRef {
         Rc::new(RefCell::new(Self::new(
             account,
@@ -77,6 +80,26 @@ impl Order {
             timestamp,
             source,
         )))
+    }
+}
+
+impl Eq for Order {}
+
+impl Ord for Order {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.local_time.cmp(&other.local_time)
+    }
+}
+
+impl PartialOrd for Order {
+    fn partial_cmp(&self, other: &Order) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Order {
+    fn eq(&self, other: &Order) -> bool {
+        self.local_time == other.local_time
     }
 }
 

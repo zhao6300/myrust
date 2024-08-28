@@ -638,14 +638,16 @@ fn skip_list_test() {
     }
 
     let mut map2: SkipMap<i64, i64> = SkipMap::new();
-    for i in 1..=10 {
-        map2.insert(i, i + 10);
-    }
+    let front = map2.front_mut();
+    print!("{:?}\n",front);
+    // for i in 1..=10 {
+    //     map2.insert(i, i + 10);
+    // }
 
     
-    for (k, v) in &mut map2 {
-        print!("k = {}, v = {}\n", k, v);
-    }
+    // for (k, v) in &mut map2 {
+    //     map2.remove(k);
+    // }
 
     // t1(&mut map);
     // loop {
@@ -759,7 +761,7 @@ fn float_test() {
         100.0,
         "s",
         OrdType::L,
-        Some(OrderSourceType::UserOrder),
+    OrderSourceType::UserOrder,
     );
     fn process_order(order: OrderRef) {
         let order2 = order.clone();
@@ -777,24 +779,45 @@ fn float_test() {
     }
 
     // process_order(order);
-    let mut queue: VecDeque<Option<i64>> = VecDeque::new();
-    for i in 1..=3 {
-        if i == 2 {
-            queue.push_back(None);
-        } else {
-            queue.push_back(Some(i));
-        }
+    let mut queue: VecDeque<Option<(i64, i64)>> = VecDeque::new();
+    // for i in 1..=10 {
+    //     if i == 2 {
+    //         queue.push_back(None);
+    //     } else {
+    //         queue.push_back(Some((i,10)));
+    //     }
+    // }
+    for i in 1..=10 {
+        queue.push_back(Some((i%3,i)));
     }
 
-    let iter = queue.iter_mut();
-    for idx in 0..queue.len() {
-        match &queue[idx] {
-            Some(value) => print!("{:?},", queue[idx]),
-            None => continue,
+    let mut iter = queue.iter_mut();
+    loop {
+        let i = iter.next();
+        if let Some(v) = i{
+            print!("{:?}\n", v);
+        }else {
+            break;
         }
     }
-    print!("\n");
+    // for i in iter{
+    //     print!("{:?}\n", i);
+    // }
+
+    // print!("{:?}\n", queue);
+    // queue.make_contiguous().sort();
+    // print!("{:?}\n", queue);
+    // let iter = queue.iter_mut();
+    // for idx in 0..queue.len() {
+    //     match &queue[idx] {
+    //         Some(value) => print!("{:?},", queue[idx]),
+    //         None => continue,
+    //     }
+    // }
+    // print!("\n");
 }
+
+
 
 fn main() {
     // test1();
@@ -813,6 +836,6 @@ fn main() {
     // lifetime_test();
     // array_test();
     // macro_test();
-    skip_list_test();
-    // float_test();
+    // skip_list_test();
+    float_test();
 }

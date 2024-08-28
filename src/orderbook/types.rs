@@ -1,7 +1,9 @@
-use super::MarketError;
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ord, Ordering};
+use std::i32;
 use std::str::FromStr;
+
+use super::MarketError;
 pub type OrderId = u64;
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Deserialize, Serialize)]
@@ -64,8 +66,20 @@ pub enum OrdType {
     C = 4,
     ///市价全额成交或撤销
     D = 5,
-
+    ///取消委托
+    Cancel = 6,
     Unsupported = 255,
+}
+
+impl OrdType {
+    pub fn from_i32(type_num: i32) -> Result<OrdType, MarketError> {
+        match type_num {
+            10 => Ok(OrdType::Cancel),
+            2 => Ok(OrdType::L),
+            3 => Ok(OrdType::N),
+            _ => Err(MarketError::OrderTypeUnsupported),
+        }
+    }
 }
 
 impl FromStr for OrdType {
@@ -147,14 +161,15 @@ impl AsRef<str> for ExchangeMode {
     }
 }
 
-#[derive(Eq, Debug)]
-struct PriceTick {
+#[derive(Eq, Debug, Deserialize, Serialize, Clone, Copy)]
+pub struct PriceTick {
     pub price_tick: i64,
+    #[serde(skip_serializing)]
     pub reverse: bool,
 }
 
 impl PriceTick {
-    fn new(price_tick: i64, reverse: bool) -> Self {
+    pub fn new(price_tick: i64, reverse: bool) -> Self {
         Self {
             price_tick: price_tick,
             reverse: reverse,

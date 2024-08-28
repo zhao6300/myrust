@@ -5,6 +5,7 @@ pub mod order;
 pub mod skiplist_helper;
 pub mod skiplist_orderbook;
 pub mod types;
+pub mod statistics;
 use order::OrderRef;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -20,11 +21,15 @@ pub const INVALID_MIN: i64 = i64::MIN;
 /// Represents no best ask in ticks.
 pub const INVALID_MAX: i64 = i64::MAX;
 
-pub type OrderId = u64;
+pub type OrderId = i64;
 /// Represents no best bid in ticks.
 
 #[derive(Error, Debug)]
 pub enum MarketError {
+    #[error("stock type is not supported")]
+    StockTypeUnSupported,
+    #[error("history data is none ")]
+    HistoryIsNone,
     #[error("market side error")]
     MarketSideError,
     #[error("borker for stock already exists")]
@@ -101,7 +106,7 @@ pub struct L3Order {
     pub order_id: OrderId,
     pub side: Side,
     /// 除以tick size后的值
-    pub price_tick: i64,
+    pub price_tick: PriceTick,
     /// 除以lot_size之后的值，比如股票的lot_size是100，这里就是手
     pub vol: i64,
     ///用于不改变历史时的计算
@@ -120,12 +125,17 @@ impl L3Order {
         vol: i64,
         timestamp: i64,
     ) -> Self {
+        let reverse = match side {
+            Side::Buy => true,
+            _ => false,
+        };
+
         Self {
             source: source,
             account: account,
             order_id: order_id,
             side: side,
-            price_tick: price_tick,
+            price_tick: PriceTick::new(price_tick, reverse),
             vol: vol,
             vol_shadow: vol,
             idx: 0,
@@ -222,5 +232,6 @@ pub trait Processor {
 
 pub trait OrderIter {
     type Item;
-    fn next(&mut self) -> Option<Self::Item>;
+    fn next(&self) -> Option<&Self::Item>;
+    fn is_last(&self) -> bool;
 }
