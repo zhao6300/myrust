@@ -9,9 +9,13 @@ pub type OrderId = u64;
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Deserialize, Serialize)]
 #[repr(i8)]
 pub enum Side {
+    /// 代表买入订单。
     Buy = 1,
+    /// 代表卖出订单。
     Sell = -1,
+    /// 代表未指定或中性方向。
     None = 0,
+    /// 代表不支持的方向。
     Unsupported = 127,
 }
 
@@ -30,7 +34,7 @@ impl FromStr for Side {
     type Err = ();
 
     fn from_str(input: &str) -> Result<Side, Self::Err> {
-        match input {
+        match input.to_lowercase().as_str() {
             "buy" => Ok(Side::Buy),
             "sell" => Ok(Side::Sell),
             "none" => Ok(Side::None),
@@ -54,24 +58,33 @@ impl AsRef<str> for Side {
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum OrdType {
-    ///为‘L’表示普通限价订单；
+    /// 代表普通限价订单。
     L = 0,
-    ///为‘M’表示最优五档即时成交剩余撤销的市价订单
+    /// 代表最优五档即时成交剩余撤销的市价订单。
     M = 1,
-    ///为‘N’ 表示最优五档即时成交剩余转限价的市价订单
+    /// 代表最优五档即时成交剩余转限价的市价订单。
     N = 2,
-    ///为’B’ 表示以本方最优价格申报的市价订单
+    /// 代表以本方最优价格申报的市价订单。
     B = 3,
-    ///为’C’ 表示以对手方最优价格申报的市价订单
+    /// 代表以对手方最优价格申报的市价订单。
     C = 4,
-    ///市价全额成交或撤销
+    /// 代表市价全额成交或撤销订单。
     D = 5,
-    ///取消委托
+    /// 代表取消委托。
     Cancel = 6,
+    /// 代表不支持的订单类型。
     Unsupported = 255,
 }
 
 impl OrdType {
+    /// 根据整数值创建 `OrdType` 枚举。
+    ///
+    /// # 参数
+    /// - `type_num`: 订单类型的整数表示。
+    ///
+    /// # 返回
+    /// - `Ok(OrdType)`: 对应的订单类型。
+    /// - `Err(MarketError)`: 如果类型不被支持，返回错误。
     pub fn from_i32(type_num: i32) -> Result<OrdType, MarketError> {
         match type_num {
             10 => Ok(OrdType::Cancel),
@@ -101,8 +114,11 @@ impl FromStr for OrdType {
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum OrderSourceType {
+    /// 代表本地订单。
     LocalOrder = 0,
+    /// 代表用户订单。
     UserOrder = 1,
+    /// 代表未知来源。
     Unknown = 255,
 }
 
@@ -110,9 +126,9 @@ impl FromStr for OrderSourceType {
     type Err = ();
 
     fn from_str(input: &str) -> Result<OrderSourceType, Self::Err> {
-        match input {
-            "limit" => Ok(OrderSourceType::LocalOrder),
-            "market" => Ok(OrderSourceType::UserOrder),
+        match input.to_lowercase().as_str() {
+            "localorder" => Ok(OrderSourceType::LocalOrder),
+            "userorder" => Ok(OrderSourceType::UserOrder),
             _ => Ok(OrderSourceType::Unknown),
         }
     }
@@ -120,22 +136,33 @@ impl FromStr for OrderSourceType {
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Serialize, Deserialize)]
 #[repr(u8)]
-pub enum Status {
+pub enum OrderStatus {
+    /// 代表无状态。
     None = 0,
+    /// 代表新订单。
     New = 1,
+    /// 代表订单过期。
     Expired = 2,
+    /// 代表订单已成交。
     Filled = 3,
+    /// 代表订单已取消。
     Canceled = 4,
+    /// 代表订单部分成交。
     PartiallyFilled = 5,
+    /// 代表订单被拒绝。
     Rejected = 6,
+    /// 代表不支持的状态。
     Unsupported = 255,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ExchangeMode {
+    /// 代表回测模式。
     Backtest = 0,
+    /// 代表实盘模式。
     Live = 1,
+    /// 代表不支持的模式。
     Unsupported = 255,
 }
 
@@ -143,7 +170,7 @@ impl FromStr for ExchangeMode {
     type Err = ();
 
     fn from_str(input: &str) -> Result<ExchangeMode, Self::Err> {
-        match input {
+        match input.to_lowercase().as_str() {
             "backtest" => Ok(ExchangeMode::Backtest),
             "live" => Ok(ExchangeMode::Live),
             _ => Ok(ExchangeMode::Unsupported),
@@ -163,7 +190,9 @@ impl AsRef<str> for ExchangeMode {
 
 #[derive(Eq, Debug, Deserialize, Serialize, Clone, Copy)]
 pub struct PriceTick {
+    /// 价格跳动的整数值。
     pub price_tick: i64,
+    /// 是否反转排序。
     #[serde(skip_serializing)]
     pub reverse: bool,
 }
@@ -204,7 +233,34 @@ impl PartialEq for PriceTick {
 
 #[cfg(test)]
 mod tests {
-    use super::PriceTick;
+    use super::*;
+
+    #[test]
+    fn test_side_from_str() {
+        assert_eq!(Side::from_str("buy").unwrap(), Side::Buy);
+        assert_eq!(Side::from_str("sell").unwrap(), Side::Sell);
+        assert_eq!(Side::from_str("none").unwrap(), Side::None);
+        assert_eq!(Side::from_str("invalid").unwrap(), Side::Unsupported);
+    }
+
+    #[test]
+    fn test_ord_type_from_i32() {
+        assert_eq!(OrdType::from_i32(10).unwrap(), OrdType::Cancel);
+        assert_eq!(OrdType::from_i32(2).unwrap(), OrdType::L);
+        assert_eq!(OrdType::from_i32(3).unwrap(), OrdType::N);
+        assert!(OrdType::from_i32(999).is_err());
+    }
+
+    #[test]
+    fn test_ord_type_from_str_with_edge_cases() {
+        assert_eq!(OrdType::from_str("L").unwrap(), OrdType::L);
+        assert_eq!(OrdType::from_str("M").unwrap(), OrdType::M);
+        assert_eq!(OrdType::from_str("N").unwrap(), OrdType::N);
+        assert_eq!(OrdType::from_str("B").unwrap(), OrdType::B);
+        assert_eq!(OrdType::from_str("C").unwrap(), OrdType::C);
+        assert_eq!(OrdType::from_str("D").unwrap(), OrdType::D);
+        assert_eq!(OrdType::from_str("unknown").unwrap(), OrdType::Unsupported);
+    }
 
     #[test]
     fn test_price_tick() {
@@ -215,5 +271,16 @@ mod tests {
         let price_tick1: PriceTick = PriceTick::new(100, false);
         let price_tick2: PriceTick = PriceTick::new(101, false);
         assert_eq!(price_tick1 < price_tick2, true);
+    }
+
+    #[test]
+    fn test_price_tick_equality() {
+        let price_tick1: PriceTick = PriceTick::new(100, true);
+        let price_tick2: PriceTick = PriceTick::new(100, true);
+        assert_eq!(price_tick1, price_tick2);
+
+        let price_tick1: PriceTick = PriceTick::new(100, true);
+        let price_tick2: PriceTick = PriceTick::new(100, false);
+        assert_eq!(price_tick1, price_tick2);
     }
 }

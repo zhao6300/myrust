@@ -1,4 +1,4 @@
-use super::{OrdType, OrderId, OrderSourceType, Side, Status};
+use super::{OrdType, OrderId, OrderSourceType, OrderStatus, Side};
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ord, Ordering};
 use std::str::FromStr;
@@ -17,16 +17,18 @@ pub struct Order {
     pub price_tick: i64,
     pub order_type: OrdType,
     pub side: Side,
-    pub status: Status,
+    pub status: OrderStatus,
     pub source: OrderSourceType,
     pub recv_num: i64,
     pub account: Option<String>,
     pub seq: i64,
-
+    pub position: i64,
     /// 和盘口成交的数量
     pub filled_qty: f64,
     /// 成交后剩余的数量
     pub left_qty: f64,
+    #[serde(skip)]
+    pub dirty: bool,
 }
 
 impl Order {
@@ -50,13 +52,15 @@ impl Order {
             order_id: 0,
             order_type: order_type,
             side: side,
-            status: Status::New,
+            status: OrderStatus::New,
             source: source,
             recv_num: 0,
             account: account,
             filled_qty: 0.0,
             left_qty: qty,
+            position: -1,
             seq: 0,
+            dirty: false,
         }
     }
 
@@ -81,6 +85,16 @@ impl Order {
             source,
         )))
     }
+
+    pub fn update(&mut self) {
+        if self.qty != self.filled_qty {
+            self.status = OrderStatus::PartiallyFilled;
+            self.left_qty = self.qty - self.filled_qty;
+        } else {
+            self.status = OrderStatus::Filled;
+            self.left_qty = 0.0;
+        }
+    }
 }
 
 impl Eq for Order {}
@@ -104,3 +118,156 @@ impl PartialEq for Order {
 }
 
 pub type OrderRef = Rc<RefCell<Order>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_order_creation() {
+        let order = Order::new(
+            Some("account1".to_string()),
+            "AAPL".to_string(),
+            150.0,
+            10.0,
+            Side::Buy,
+            OrdType::L,
+            1234567890,
+            OrderSourceType::LocalOrder,
+        );
+
+        assert_eq!(order.stock_code, "AAPL");
+        assert_eq!(order.price, 150.0);
+        assert_eq!(order.qty, 10.0);
+        assert_eq!(order.side, Side::Buy);
+        assert_eq!(order.order_type, OrdType::L);
+        assert_eq!(order.status, OrderStatus::New);
+        assert_eq!(order.local_time, 1234567890);
+        assert_eq!(order.exch_time, 0);
+        assert_eq!(order.source, OrderSourceType::LocalOrder);
+        assert_eq!(order.filled_qty, 0.0);
+        assert_eq!(order.left_qty, 10.0);
+    }
+
+    #[test]
+    fn test_order_ref_creation() {
+        let order_ref = Order::new_ref(
+            Some("account1".to_string()),
+            "AAPL".to_string(),
+            1234567890,
+            150.0,
+            10.0,
+            "Buy",
+            OrdType::L,
+            OrderSourceType::LocalOrder,
+        );
+
+        let order = order_ref.borrow();
+        assert_eq!(order.stock_code, "AAPL");
+        assert_eq!(order.price, 150.0);
+        assert_eq!(order.qty, 10.0);
+        assert_eq!(order.side, Side::Buy);
+        assert_eq!(order.order_type, OrdType::L);
+        assert_eq!(order.status, OrderStatus::New);
+        assert_eq!(order.local_time, 1234567890);
+        assert_eq!(order.exch_time, 0);
+        assert_eq!(order.source, OrderSourceType::LocalOrder);
+        assert_eq!(order.filled_qty, 0.0);
+        assert_eq!(order.left_qty, 10.0);
+    }
+
+    #[test]
+    fn test_order_update_partial_fill() {
+        let mut order = Order::new(
+            Some("account1".to_string()),
+            "AAPL".to_string(),
+            150.0,
+            10.0,
+            Side::Buy,
+            OrdType::L,
+            1234567890,
+            OrderSourceType::LocalOrder,
+        );
+
+        order.filled_qty = 5.0;
+        order.update();
+
+        assert_eq!(order.status, OrderStatus::PartiallyFilled);
+        assert_eq!(order.left_qty, 5.0);
+    }
+
+    #[test]
+    fn test_order_update_full_fill() {
+        let mut order = Order::new(
+            Some("account1".to_string()),
+            "AAPL".to_string(),
+            150.0,
+            10.0,
+            Side::Buy,
+            OrdType::L,
+            1234567890,
+            OrderSourceType::LocalOrder,
+        );
+
+        order.filled_qty = 10.0;
+        order.update();
+
+        assert_eq!(order.status, OrderStatus::Filled);
+        assert_eq!(order.left_qty, 0.0);
+    }
+
+    #[test]
+    fn test_order_cmp() {
+        let order1 = Order::new(
+            Some("account1".to_string()),
+            "AAPL".to_string(),
+            150.0,
+            10.0,
+            Side::Buy,
+            OrdType::L,
+            1234567890,
+            OrderSourceType::LocalOrder,
+        );
+
+        let order2 = Order::new(
+            Some("account2".to_string()),
+            "GOOG".to_string(),
+            100.0,
+            5.0,
+            Side::Sell,
+            OrdType::L,
+            1234567891,
+            OrderSourceType::LocalOrder,
+        );
+
+        assert!(order1 < order2);
+        assert!(order2 > order1);
+    }
+
+    #[test]
+    fn test_order_eq() {
+        let order1 = Order::new(
+            Some("account1".to_string()),
+            "AAPL".to_string(),
+            150.0,
+            10.0,
+            Side::Buy,
+            OrdType::L,
+            1234567890,
+            OrderSourceType::LocalOrder,
+        );
+
+        let order2 = Order::new(
+            Some("account2".to_string()),
+            "GOOG".to_string(),
+            100.0,
+            5.0,
+            Side::Sell,
+            OrdType::L,
+            1234567890,
+            OrderSourceType::LocalOrder,
+        );
+
+        assert_eq!(order1, order2);
+    }
+}

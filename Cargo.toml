@@ -8,8 +8,10 @@ edition = "2021"
 [dependencies]
 chrono = "0.4.38"
 error = "0.1.9"
+hdrs = "0.3.2"
 ordered-float = "4.2.2"
-polars = "0.42.0"
+parquet2 = "0.17.2"
+polars = {version = "0.42.0", features = ["concat_str","lazy", "parquet","random","sql", "list_eval","serde", "is_in", "diff","rolling_window", "round_series"]}
 rayon = "1.10.0"
 serde = { version = "1.0.207", features = ["derive","rc"] }
 serde_json = "1.0.124"
