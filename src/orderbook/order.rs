@@ -1,34 +1,39 @@
-use super::{OrdType, OrderId, OrderSourceType, OrderStatus, Side};
+use super::{OrderType, OrderId, OrderSourceType, OrderStatus, Side};
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ord, Ordering};
 use std::str::FromStr;
 use std::{cell::RefCell, rc::Rc};
 
 #[derive(Debug, Deserialize, Serialize)]
+/// 表示订单的结构体
+/// 包含了订单的基本信息和状态
 pub struct Order {
-    pub order_id: OrderId,
-    pub stock_code: String,
+    pub order_id: OrderId,  // 订单 ID
+    pub stock_code: String, // 股票代码
     /// 交易所接收到订单的时间
+    /// 格式为 `20230801093939123`（年-月-日-时-分-秒-毫秒）
     pub local_time: i64,
     /// 交易所处理订单的时间
+    /// 格式为 `20230801093939123`（年-月-日-时-分-秒-毫秒）
     pub exch_time: i64,
-    pub qty: f64,
-    pub price: f64,
-    pub price_tick: i64,
-    pub order_type: OrdType,
-    pub side: Side,
-    pub status: OrderStatus,
-    pub source: OrderSourceType,
-    pub recv_num: i64,
-    pub account: Option<String>,
-    pub seq: i64,
-    pub position: i64,
+    pub qty: f64,            // 订单数量
+    pub price: f64,          // 订单价格
+    pub price_tick: i64,     // 价格档位
+    pub order_type: OrderType, // 订单类型
+    pub side: Side,          // 买卖方向
+    pub status: OrderStatus, // 订单状态
+    #[serde(skip_serializing)]
+    pub source: OrderSourceType, // 订单来源类型
+    pub account: Option<String>, // 账户信息
+    #[serde(skip_serializing)]
+    pub seq: i64, // 序列号
+    pub queue: f64,          // 持仓量
     /// 和盘口成交的数量
     pub filled_qty: f64,
     /// 成交后剩余的数量
     pub left_qty: f64,
-    #[serde(skip)]
-    pub dirty: bool,
+    #[serde(skip_serializing)]
+    pub dirty: bool, // 数据是否被修改标志
 }
 
 impl Order {
@@ -38,7 +43,7 @@ impl Order {
         price: f64,
         qty: f64,
         side: Side,
-        order_type: OrdType,
+        order_type: OrderType,
         timestamp: i64,
         source: OrderSourceType,
     ) -> Self {
@@ -54,11 +59,10 @@ impl Order {
             side: side,
             status: OrderStatus::New,
             source: source,
-            recv_num: 0,
             account: account,
             filled_qty: 0.0,
             left_qty: qty,
-            position: -1,
+            queue: 0.0,
             seq: 0,
             dirty: false,
         }
@@ -71,7 +75,7 @@ impl Order {
         price: f64,
         qty: f64,
         bs_flag: &str,
-        order_type: OrdType,
+        order_type: OrderType,
         source: OrderSourceType,
     ) -> OrderRef {
         Rc::new(RefCell::new(Self::new(
@@ -131,7 +135,7 @@ mod tests {
             150.0,
             10.0,
             Side::Buy,
-            OrdType::L,
+            OrderType::L,
             1234567890,
             OrderSourceType::LocalOrder,
         );
@@ -140,7 +144,7 @@ mod tests {
         assert_eq!(order.price, 150.0);
         assert_eq!(order.qty, 10.0);
         assert_eq!(order.side, Side::Buy);
-        assert_eq!(order.order_type, OrdType::L);
+        assert_eq!(order.order_type, OrderType::L);
         assert_eq!(order.status, OrderStatus::New);
         assert_eq!(order.local_time, 1234567890);
         assert_eq!(order.exch_time, 0);
@@ -158,7 +162,7 @@ mod tests {
             150.0,
             10.0,
             "Buy",
-            OrdType::L,
+            OrderType::L,
             OrderSourceType::LocalOrder,
         );
 
@@ -167,7 +171,7 @@ mod tests {
         assert_eq!(order.price, 150.0);
         assert_eq!(order.qty, 10.0);
         assert_eq!(order.side, Side::Buy);
-        assert_eq!(order.order_type, OrdType::L);
+        assert_eq!(order.order_type, OrderType::L);
         assert_eq!(order.status, OrderStatus::New);
         assert_eq!(order.local_time, 1234567890);
         assert_eq!(order.exch_time, 0);
@@ -184,7 +188,7 @@ mod tests {
             150.0,
             10.0,
             Side::Buy,
-            OrdType::L,
+            OrderType::L,
             1234567890,
             OrderSourceType::LocalOrder,
         );
@@ -204,7 +208,7 @@ mod tests {
             150.0,
             10.0,
             Side::Buy,
-            OrdType::L,
+            OrderType::L,
             1234567890,
             OrderSourceType::LocalOrder,
         );
@@ -224,7 +228,7 @@ mod tests {
             150.0,
             10.0,
             Side::Buy,
-            OrdType::L,
+            OrderType::L,
             1234567890,
             OrderSourceType::LocalOrder,
         );
@@ -235,7 +239,7 @@ mod tests {
             100.0,
             5.0,
             Side::Sell,
-            OrdType::L,
+            OrderType::L,
             1234567891,
             OrderSourceType::LocalOrder,
         );
@@ -252,7 +256,7 @@ mod tests {
             150.0,
             10.0,
             Side::Buy,
-            OrdType::L,
+            OrderType::L,
             1234567890,
             OrderSourceType::LocalOrder,
         );
@@ -263,7 +267,7 @@ mod tests {
             100.0,
             5.0,
             Side::Sell,
-            OrdType::L,
+            OrderType::L,
             1234567890,
             OrderSourceType::LocalOrder,
         );

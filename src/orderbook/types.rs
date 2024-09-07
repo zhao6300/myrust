@@ -3,7 +3,7 @@ use std::cmp::{Ord, Ordering};
 use std::i32;
 use std::str::FromStr;
 
-use super::MarketError;
+use super::{KeyOp, MarketError};
 pub type OrderId = u64;
 
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Deserialize, Serialize)]
@@ -12,20 +12,41 @@ pub enum Side {
     /// 代表买入订单。
     Buy = 1,
     /// 代表卖出订单。
-    Sell = -1,
+    Sell = 2,
     /// 代表未指定或中性方向。
     None = 0,
     /// 代表不支持的方向。
     Unsupported = 127,
 }
 
-impl AsRef<f64> for Side {
-    fn as_ref(&self) -> &f64 {
+impl Side {
+    /// 从 `i32` 转换为 `Side`
+    ///
+    /// # 参数
+    /// * `type_num` - 需要转换的 `i32` 数值
+    ///
+    /// # 返回
+    /// * `Ok(Side)` - 成功时返回对应的 `Side`
+    /// * `Err(MarketError)` - 如果不支持该 `i32` 数值，返回 `MarketError::SideUnsupported`
+    pub fn from_i32(type_num: i32) -> Result<Side, MarketError> {
+        match type_num {
+            1 => Ok(Side::Buy),
+            2 => Ok(Side::Sell),
+            0 => Ok(Side::None),
+            _ => Err(MarketError::MarketSideError),
+        }
+    }
+
+    /// 将 `Side` 转换为对应的 `i32` 值
+    ///
+    /// # 返回
+    /// * `i32` - 对应的 `i32` 数值
+    pub fn to_i32(self) -> i32 {
         match self {
-            Side::Buy => &1.0f64,
-            Side::Sell => &-1.0f64,
-            Side::None => panic!("Side::None"),
-            Side::Unsupported => panic!("Side::Unsupported"),
+            Side::Buy => 1,
+            Side::Sell => 2,
+            Side::None => 0,
+            Side::Unsupported => 127,
         }
     }
 }
@@ -36,7 +57,9 @@ impl FromStr for Side {
     fn from_str(input: &str) -> Result<Side, Self::Err> {
         match input.to_lowercase().as_str() {
             "buy" => Ok(Side::Buy),
+            "b" => Ok(Side::Buy),
             "sell" => Ok(Side::Sell),
+            "s" => Ok(Side::Sell),
             "none" => Ok(Side::None),
             _ => Ok(Side::Unsupported),
         }
@@ -57,7 +80,7 @@ impl AsRef<str> for Side {
 /// Order type
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Serialize, Deserialize)]
 #[repr(u8)]
-pub enum OrdType {
+pub enum OrderType {
     /// 代表普通限价订单。
     L = 0,
     /// 代表最优五档即时成交剩余撤销的市价订单。
@@ -72,41 +95,80 @@ pub enum OrdType {
     D = 5,
     /// 代表取消委托。
     Cancel = 6,
+    /// 用在回测模式时用于完全模拟市场订单的行为
+    None = 250,
     /// 代表不支持的订单类型。
     Unsupported = 255,
 }
 
-impl OrdType {
-    /// 根据整数值创建 `OrdType` 枚举。
+impl OrderType {
+    /// 根据整数值创建 `OrderType` 枚举。
     ///
     /// # 参数
     /// - `type_num`: 订单类型的整数表示。
     ///
     /// # 返回
-    /// - `Ok(OrdType)`: 对应的订单类型。
+    /// - `Ok(OrderType)`: 对应的订单类型。
     /// - `Err(MarketError)`: 如果类型不被支持，返回错误。
-    pub fn from_i32(type_num: i32) -> Result<OrdType, MarketError> {
+    pub fn from_i32(type_num: i32) -> Result<OrderType, MarketError> {
         match type_num {
-            10 => Ok(OrdType::Cancel),
-            2 => Ok(OrdType::L),
-            3 => Ok(OrdType::N),
+            10 | 0 => Ok(OrderType::Cancel),
+            1 => Ok(OrderType::C),
+            2 => Ok(OrderType::L),
+            3 => Ok(OrderType::B),
             _ => Err(MarketError::OrderTypeUnsupported),
+        }
+    }
+    /// 将 `OrderType` 转换为对应的 `i32` 值
+    ///
+    /// # 返回
+    /// * `i32` - 对应的 `i32` 值
+    pub fn to_i32(&self) -> i32 {
+        match self {
+            OrderType::Cancel => 10,
+            OrderType::C => 1,
+            OrderType::L => 2,
+            OrderType::B => 3,
+            // 如果有更多的 `OrderType` 变体，请在此补充
+            // 其他未处理的情况返回 255
+            _ => 255,
         }
     }
 }
 
-impl FromStr for OrdType {
+impl FromStr for OrderType {
     type Err = ();
 
-    fn from_str(input: &str) -> Result<OrdType, Self::Err> {
+    fn from_str(input: &str) -> Result<OrderType, Self::Err> {
         match input {
-            "L" => Ok(OrdType::L),
-            "M" => Ok(OrdType::M),
-            "N" => Ok(OrdType::N),
-            "B" => Ok(OrdType::B),
-            "C" => Ok(OrdType::C),
-            "D" => Ok(OrdType::D),
-            _ => Ok(OrdType::Unsupported),
+            "L" => Ok(OrderType::L),
+            "M" => Ok(OrderType::M),
+            "N" => Ok(OrderType::N),
+            "B" => Ok(OrderType::B),
+            "C" => Ok(OrderType::C),
+            "D" => Ok(OrderType::D),
+            _ => Ok(OrderType::Unsupported),
+        }
+    }
+}
+
+/// 市场类型的枚举
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Eq, PartialEq)]
+#[repr(u8)]
+pub enum MarketType {
+    SH = 0,
+    SZ = 1,
+    Unknown = 255,
+}
+
+impl FromStr for MarketType {
+    type Err = MarketError;
+
+    fn from_str(input: &str) -> Result<MarketType, Self::Err> {
+        match input.to_lowercase().as_str() {
+            "sh" | "shanghai" => Ok(MarketType::SH),
+            "sz" | "shenzhen" => Ok(MarketType::SH),
+            _ => Err(MarketError::MarketTypeUnknownError),
         }
     }
 }
@@ -193,7 +255,7 @@ pub struct PriceTick {
     /// 价格跳动的整数值。
     pub price_tick: i64,
     /// 是否反转排序。
-    #[serde(skip_serializing)]
+    #[serde(skip)]
     pub reverse: bool,
 }
 
@@ -203,6 +265,18 @@ impl PriceTick {
             price_tick: price_tick,
             reverse: reverse,
         }
+    }
+}
+
+impl KeyOp for PriceTick {
+    fn set_key(&mut self, price_tick: i64) {
+        self.price_tick = price_tick;
+    }
+    fn get_key(&self) -> i64 {
+        self.price_tick
+    }
+    fn set_reverse(&mut self, reverse: bool) {
+        self.reverse = reverse;
     }
 }
 
@@ -245,21 +319,24 @@ mod tests {
 
     #[test]
     fn test_ord_type_from_i32() {
-        assert_eq!(OrdType::from_i32(10).unwrap(), OrdType::Cancel);
-        assert_eq!(OrdType::from_i32(2).unwrap(), OrdType::L);
-        assert_eq!(OrdType::from_i32(3).unwrap(), OrdType::N);
-        assert!(OrdType::from_i32(999).is_err());
+        assert_eq!(OrderType::from_i32(10).unwrap(), OrderType::Cancel);
+        assert_eq!(OrderType::from_i32(2).unwrap(), OrderType::L);
+        assert_eq!(OrderType::from_i32(3).unwrap(), OrderType::N);
+        assert!(OrderType::from_i32(999).is_err());
     }
 
     #[test]
     fn test_ord_type_from_str_with_edge_cases() {
-        assert_eq!(OrdType::from_str("L").unwrap(), OrdType::L);
-        assert_eq!(OrdType::from_str("M").unwrap(), OrdType::M);
-        assert_eq!(OrdType::from_str("N").unwrap(), OrdType::N);
-        assert_eq!(OrdType::from_str("B").unwrap(), OrdType::B);
-        assert_eq!(OrdType::from_str("C").unwrap(), OrdType::C);
-        assert_eq!(OrdType::from_str("D").unwrap(), OrdType::D);
-        assert_eq!(OrdType::from_str("unknown").unwrap(), OrdType::Unsupported);
+        assert_eq!(OrderType::from_str("L").unwrap(), OrderType::L);
+        assert_eq!(OrderType::from_str("M").unwrap(), OrderType::M);
+        assert_eq!(OrderType::from_str("N").unwrap(), OrderType::N);
+        assert_eq!(OrderType::from_str("B").unwrap(), OrderType::B);
+        assert_eq!(OrderType::from_str("C").unwrap(), OrderType::C);
+        assert_eq!(OrderType::from_str("D").unwrap(), OrderType::D);
+        assert_eq!(
+            OrderType::from_str("unknown").unwrap(),
+            OrderType::Unsupported
+        );
     }
 
     #[test]

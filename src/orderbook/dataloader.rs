@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
+use std::str::FromStr;
 
 use super::dataapi::DataApi;
+use super::utils::is_in_call_auction;
 use super::*;
-use order::{Order, OrderRef};
 use polars::export::num::ToPrimitive;
 use polars::prelude::*;
 use rayon::prelude::*;
@@ -26,24 +27,31 @@ use rayon::prelude::*;
 /// * `current_idx` - 当前正在处理的订单索引。
 /// * `len` - 当前订单队列的长度。
 /// * `da_api` - 数据接口，用于加载订单和交易数据。
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DataCollator {
-    pub exchange_code: String,              // 交易所代码
-    pub stock_code: String,                 // 股票代码
-    pub file_type: String,                  // 数据文件类型（如本地或HDFS）
-    pub data_path: String,                  // 数据路径
-    pub source: OrderSourceType,            // 订单来源类型
-    pub df_order: DataFrame,                // 订单数据框架
-    pub df_trade: DataFrame,                // 交易数据框架
-    pub last_df_order_idx: usize,           // 上次处理的订单数据索引
-    pub last_df_trade_idx: usize,           // 上次处理的交易数据索引
-    pub is_last: bool,                      // 是否是最后一个数据
-    pub orders: HashMap<OrderId, OrderRef>, // 订单映射
+    pub date: String,
+    pub exchange_code: String,   // 交易所代码
+    pub stock_code: String,      // 股票代码
+    pub file_type: String,       // 数据文件类型（如本地或HDFS）
+    pub data_path: String,       // 数据路径
+    pub source: OrderSourceType, // 订单来源类型
+    #[serde(skip)]
+    pub df_order: Option<DataFrame>, // 订单数据框架
+    #[serde(skip)]
+    pub df_trade: Option<DataFrame>, // 交易数据框架
+    #[serde(skip)]
+    pub is_last: bool, // 是否是最后一个数据
+    #[serde(skip)]
+    pub orders: Option<HashMap<OrderId, L3OrderRef>>, // 订单映射
     /// 按照 order_seq 排序的队列，其中包含 order_seq 和 order_id，如果是撤单，第三个值为 true。
-    pub index_by_seq: VecDeque<(i64, i64)>,
+    #[serde(skip)]
+    pub index_by_seq: Option<VecDeque<(i64, i64)>>,
     pub current_idx: usize, // 当前处理的索引
-    pub len: usize,         // 队列长度
-    pub da_api: DataApi,    // 数据 API 对象
+    #[serde(skip)]
+    pub len: usize, // 队列长度
+    #[serde(skip)]
+    pub da_api: Option<DataApi>, // 数据 API 对象
+    mode: String,
 }
 
 impl DataCollator {
@@ -60,168 +68,444 @@ impl DataCollator {
     /// # 返回值
     /// 返回一个新的 `DataCollator` 实例。
     pub fn new(
-        exchange_code: String,
         stock_code: String,
         file_type: String,
         data_path: String,
         date: String, //%Y%m%d
         mode: &str,
     ) -> Self {
-        let restrict_aggressive_order =
-            !stock_code.is_empty() && stock_code.chars().nth(0) == Some('3');
-        // 检查并设置交易所代码
-        let exchange_code = if stock_code.ends_with("SH") {
-            "SH".to_string()
-        } else {
-            "SZ".to_string()
-        };
-
         // 校验模式是否合法
         let mode_upper = mode.to_uppercase();
         if !["ORDER", "L2P"].contains(&mode_upper.as_str()) {
             panic!("撮合模式只有 ORDER, L2P 两种，请重新输入！");
         }
-
-        let da_api = DataApi::new(
-            date.clone(),
-            file_type.to_string(),
-            mode_upper,
-            data_path.to_string(),
-        );
-        
-        // 加载订单和交易数据（根据文件类型判断是否加载）
-        let (df_order, df_trade) = if file_type == "local" || file_type == "hdfs" {
-            (
-                da_api.load_order_data(&stock_code, false),
-                da_api.load_transaction_data(&stock_code, false),
-            )
-        } else {
-            (DataFrame::default(), DataFrame::default())
-        };
-
-        // 计算数据总量（订单和交易）
-        let size = df_order.shape().0 + df_trade.shape().0;
-
+        let exchange_code = "shanghai".to_string();
         Self {
+            date: date,
             exchange_code,
             stock_code: stock_code.clone().to_string(),
             file_type: file_type,
             data_path: data_path,
             source: OrderSourceType::LocalOrder,
-            df_order: df_order,
-            df_trade: df_trade,
-            last_df_order_idx: 0,
-            last_df_trade_idx: 0,
+            df_order: None,
+            df_trade: None,
             is_last: false,
-            orders: HashMap::new(),
-            index_by_seq: VecDeque::new(),
+            orders: None,
+            index_by_seq: None,
             current_idx: 0,
             len: 0,
-            da_api: da_api,
+            da_api: None,
+            mode: mode_upper,
         }
     }
+
     /// 初始化 `DataCollator`，根据交易所类型加载数据。
     pub fn init(&mut self) {
+        let restrict_aggressive_order =
+            !self.stock_code.is_empty() && self.stock_code.chars().nth(0) == Some('3');
+        // 检查并设置交易所代码
+        let exchange_code = if self.stock_code.ends_with("SH") {
+            "SH".to_string()
+        } else {
+            "SZ".to_string()
+        };
+
+        self.exchange_code = exchange_code.clone();
+
+        let mut da_api = DataApi::new(
+            self.date.clone(),
+            self.file_type.clone().to_string(),
+            self.mode.clone(),
+            self.data_path.clone().to_string(),
+        );
+
+        // 加载订单和交易数据（根据文件类型判断是否加载）
+        let (df_order, df_trade) = if self.file_type == "local" || self.file_type == "hdfs" {
+            (
+                da_api.load_order_data(&self.stock_code, false),
+                da_api.load_transaction_data(&self.stock_code, false),
+            )
+        } else {
+            (DataFrame::default(), DataFrame::default())
+        };
+
+        self.df_order = Some(df_order);
+        self.df_trade = Some(df_trade);
+        self.orders = Some(HashMap::new());
+        self.index_by_seq = Some(VecDeque::new());
+        self.da_api = Some(da_api);
+
         if self.exchange_code.to_lowercase() == "sz" {
             self.init_sz();
         } else {
             self.init_sh();
         }
     }
-    /// 加载订单数据，并将其存储在 `orders` 和 `index_by_seq` 中。
-    fn load_order(&mut self) {
-        let _bs = self.df_order.column("OrderBSFlag").unwrap().i32().unwrap();
-        let _no = self.df_order.column("OrderNO").unwrap().i64().unwrap();
-        let _type = self.df_order.column("OrderType").unwrap().i32().unwrap();
-        let _p = self.df_order.column("OrderPrice").unwrap().f64().unwrap();
-        let _v = self.df_order.column("OrderQty").unwrap().f64().unwrap();
-        let _mdtime = self.df_order.column("MDTime").unwrap().i64().unwrap();
-        let _recvtime = self
+
+    pub fn get_next_timestamp(&self) -> Option<i64> {
+        if self.is_last() {
+            return None;
+        }
+        let (_, order_id) = self.index_by_seq.as_ref().unwrap()[self.current_idx];
+        Some(
+            self.orders
+                .as_ref()
+                .unwrap()
+                .get(&order_id)
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .timestamp
+                .clone(),
+        )
+    }
+    fn load_order_sz(&mut self) {
+        let order_no_col = self
             .df_order
+            .as_ref()
+            .unwrap()
+            .column("OrderNO")
+            .unwrap()
+            .i64()
+            .unwrap();
+        let order_bs_flag_col = self
+            .df_order
+            .as_ref()
+            .unwrap()
+            .column("OrderBSFlag")
+            .unwrap()
+            .i32()
+            .unwrap();
+        let order_type_col = self
+            .df_order
+            .as_ref()
+            .unwrap()
+            .column("OrderType")
+            .unwrap()
+            .i32()
+            .unwrap();
+        let order_price_col = self
+            .df_order
+            .as_ref()
+            .unwrap()
+            .column("OrderPrice")
+            .unwrap()
+            .f64()
+            .unwrap();
+        let order_qty_col = self
+            .df_order
+            .as_ref()
+            .unwrap()
+            .column("OrderQty")
+            .unwrap()
+            .f64()
+            .unwrap();
+        let recv_time_col = self
+            .df_order
+            .as_ref()
+            .unwrap()
             .column("ReceiveDateTime")
             .unwrap()
             .i64()
             .unwrap();
-        let _seq = self.df_order.column("ApplSeqNum").unwrap().i64().unwrap();
+        let seq_num_col = self
+            .df_order
+            .as_ref()
+            .unwrap()
+            .column("ApplSeqNum")
+            .unwrap()
+            .i64()
+            .unwrap();
 
-        for idx in 0..self.df_order.height() {
-            let mut order_no = _no.get(idx).unwrap();
-            let seq = _seq.get(idx).unwrap();
-
-            let side: String;
-
-            if _bs.get(idx).unwrap() == 1 {
-                side = "B".to_string();
+        for idx in 0..self.df_order.as_ref().unwrap().height() {
+            let order_no = order_no_col.get(idx).unwrap();
+            let seq_num = seq_num_col.get(idx).unwrap();
+            let side = if order_bs_flag_col.get(idx).unwrap() == 1 {
+                "B"
             } else {
-                side = "S".to_string();
-            }
-            let order_type = OrdType::from_i32(_type.get(idx).unwrap()).unwrap();
-            if order_type != OrdType::Cancel {
-                order_no = -order_no;
-            }
-            let order_ref = Order::new_ref(
-                None,
-                self.stock_code.clone(),
-                _recvtime.get(idx).unwrap(),
-                _p.get(idx).unwrap(),
-                _v.get(idx).unwrap(),
-                side.as_str(),
-                order_type,
-                OrderSourceType::LocalOrder,
-            );
-            order_ref.borrow_mut().order_id = order_no;
-            order_ref.borrow_mut().seq = seq;
-            self.orders.insert(order_no, order_ref);
+                "S"
+            };
 
-            self.index_by_seq.push_back((seq, order_no));
+            let order_type = OrderType::from_i32(order_type_col.get(idx).unwrap()).unwrap();
+            let is_cancel = order_type == OrderType::Cancel;
+            let qty = order_qty_col.get(idx).unwrap();
+
+            let order_ref = L3Order::new_ref(
+                OrderSourceType::LocalOrder,
+                None,
+                order_no,
+                Side::from_str(&side).unwrap(),
+                0,
+                0,
+                recv_time_col.get(idx).unwrap(),
+                order_type,
+            );
+
+            if !is_cancel {
+                self.orders
+                    .as_mut()
+                    .unwrap()
+                    .insert(order_no, order_ref.clone());
+                let mut order = order_ref.borrow_mut();
+                let auxiliary_info = order.auxiliary_info.as_mut().unwrap();
+
+                auxiliary_info.initial_price = order_price_col.get(idx).unwrap();
+                auxiliary_info.initial_seq = seq_num;
+                auxiliary_info.initial_qty = qty;
+            }
+        }
+    }
+    /// 加载订单数据，并将其存储在 `orders` 和 `index_by_seq` 中。
+    fn load_order_sh(&mut self) {
+        // 提取 `df_order` 数据框中的各列
+        let order_no_col = self
+            .df_order
+            .as_ref()
+            .unwrap()
+            .column("OrderNO")
+            .unwrap()
+            .i64()
+            .unwrap();
+        let order_bs_flag_col = self
+            .df_order
+            .as_ref()
+            .unwrap()
+            .column("OrderBSFlag")
+            .unwrap()
+            .i32()
+            .unwrap();
+        let order_type_col = self
+            .df_order
+            .as_ref()
+            .unwrap()
+            .column("OrderType")
+            .unwrap()
+            .i32()
+            .unwrap();
+        let order_price_col = self
+            .df_order
+            .as_ref()
+            .unwrap()
+            .column("OrderPrice")
+            .unwrap()
+            .f64()
+            .unwrap();
+        let order_qty_col = self
+            .df_order
+            .as_ref()
+            .unwrap()
+            .column("OrderQty")
+            .unwrap()
+            .f64()
+            .unwrap();
+        let md_time_col = self
+            .df_order
+            .as_ref()
+            .unwrap()
+            .column("MDTime")
+            .unwrap()
+            .i64()
+            .unwrap();
+        let seq_num_col = self
+            .df_order
+            .as_ref()
+            .unwrap()
+            .column("ApplSeqNum")
+            .unwrap()
+            .i64()
+            .unwrap();
+
+        for idx in 0..self.df_order.as_ref().unwrap().height() {
+            let order_no = order_no_col.get(idx).unwrap();
+            let seq_num = seq_num_col.get(idx).unwrap();
+            let md_time = md_time_col.get(idx).unwrap();
+            let side = if order_bs_flag_col.get(idx).unwrap() == 1 {
+                "B"
+            } else {
+                "S"
+            };
+
+            let order_type = OrderType::from_i32(order_type_col.get(idx).unwrap()).unwrap();
+            let is_cancel = order_type == OrderType::Cancel;
+            let qty = order_qty_col.get(idx).unwrap();
+
+            if !is_cancel {
+                let order_ref = L3Order::new_ref(
+                    OrderSourceType::LocalOrder,
+                    None,
+                    order_no,
+                    Side::from_str(&side).unwrap(),
+                    0,
+                    0,
+                    md_time,
+                    order_type,
+                );
+
+                let mut order = order_ref.borrow_mut();
+                let auxiliary_info = order.auxiliary_info.as_mut().unwrap();
+                auxiliary_info.initial_price = order_price_col.get(idx).unwrap();
+                auxiliary_info.initial_qty = qty;
+                auxiliary_info.initial_seq = seq_num;
+
+                self.orders
+                    .as_mut()
+                    .unwrap()
+                    .insert(order_no, order_ref.clone());
+
+                print!("== load order ==  {order:?}\n");
+            } else {
+                let order_ref = self.orders.as_mut().unwrap().get(&order_no).unwrap();
+                let mut order = order_ref.borrow_mut();
+                let auxiliary_info = order.auxiliary_info.as_mut().unwrap();
+                auxiliary_info.cancel_seq = seq_num;
+                self.index_by_seq
+                    .as_mut()
+                    .unwrap()
+                    .push_back((seq_num, order_no));
+                print!("== load cancel ==  {order:?}\n");
+            }
         }
     }
     /// 加载深圳交易所的交易数据，并更新订单信息。
     fn load_trade_sz(&mut self) {
-        let _bs = self.df_trade.column("TradeBSFlag").unwrap().i32().unwrap();
-        let _buy_no = self.df_trade.column("TradeBuyNo").unwrap().i64().unwrap();
-        let _sell_no = self.df_trade.column("TradeSellNo").unwrap().i64().unwrap();
-        let _type = self.df_trade.column("TradeType").unwrap().i32().unwrap();
-        let _p = self.df_trade.column("TradePrice").unwrap().f64().unwrap();
-        let _v = self.df_trade.column("TradeQty").unwrap().f64().unwrap();
-        let _mdtime = self.df_trade.column("MDTime").unwrap().i64().unwrap();
-        let _recvtime = self
+        let bs_flag_col = self
             .df_trade
-            .column("ReceiveDateTime")
+            .as_ref()
+            .unwrap()
+            .column("TradeBSFlag")
+            .unwrap()
+            .i32()
+            .unwrap();
+        let buy_no_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("TradeBuyNo")
             .unwrap()
             .i64()
             .unwrap();
-        let _seq = self.df_trade.column("ApplSeqNum").unwrap().i64().unwrap();
+        let sell_no_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("TradeSellNo")
+            .unwrap()
+            .i64()
+            .unwrap();
+        let trade_type_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("TradeType")
+            .unwrap()
+            .i32()
+            .unwrap();
+        let trade_price_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("TradePrice")
+            .unwrap()
+            .f64()
+            .unwrap();
+        let trade_qty_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("TradeQty")
+            .unwrap()
+            .f64()
+            .unwrap();
+        let md_time_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("MDTime")
+            .unwrap()
+            .i64()
+            .unwrap();
+        let seq_num_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("ApplSeqNum")
+            .unwrap()
+            .i64()
+            .unwrap();
 
-        for idx in 0..self.df_trade.height() {
-            let seq = _seq.get(idx).unwrap();
-            let mut order_no: i64;
-            let mut side: &str;
-            if _bs.get(idx).unwrap() == 1 {
-                order_no = _buy_no.get(idx).unwrap();
-                side = "B";
+        for idx in 0..self.df_trade.as_ref().unwrap().height() {
+            let buy_order_id = buy_no_col.get(idx).unwrap();
+            let sell_order_id = sell_no_col.get(idx).unwrap();
+            let qty = trade_qty_col.get(idx).unwrap();
+            let trade_price = trade_price_col.get(idx).unwrap();
+            let trade_type = OrderType::from_i32(trade_type_col.get(idx).unwrap()).unwrap();
+            let md_time = md_time_col.get(idx).unwrap();
+            let seq_num = seq_num_col.get(idx).unwrap();
+
+            // 根据买卖标志确定订单编号和方向
+
+            let order_type = OrderType::from_i32(trade_type_col.get(idx).unwrap()).unwrap();
+            let is_cancel = order_type == OrderType::Cancel;
+
+            // 根据买卖标志确定订单编号和方向
+            let (order_id, side) = if bs_flag_col.get(idx).unwrap() == 1 {
+                (buy_no_col.get(idx).unwrap(), "B")
             } else {
-                order_no = _sell_no.get(idx).unwrap();
-                side = "S";
-            }
+                (sell_no_col.get(idx).unwrap(), "S")
+            };
 
-            let order_type = OrdType::from_i32(_type.get(idx).unwrap()).unwrap();
-            if order_type != OrdType::Cancel {
-                order_no = -order_no;
-                let order_ref = Order::new_ref(
-                    None,
-                    self.stock_code.clone(),
-                    _recvtime.get(idx).unwrap(),
-                    _p.get(idx).unwrap(),
-                    _v.get(idx).unwrap(),
-                    side,
-                    OrdType::from_i32(_type.get(idx).unwrap()).unwrap(),
-                    OrderSourceType::LocalOrder,
-                );
-                order_ref.borrow_mut().order_id = order_no;
-                order_ref.borrow_mut().seq = seq;
-                self.orders.insert(order_no, order_ref);
-                self.index_by_seq.push_back((seq, order_no));
+            if !is_cancel {
+                let buy_order_ref = self
+                    .orders
+                    .as_mut()
+                    .unwrap()
+                    .get_mut(&buy_order_id)
+                    .unwrap()
+                    .clone();
+
+                let mut buy_order = buy_order_ref.borrow_mut();
+                let buy_auxiliary_info = buy_order.auxiliary_info.as_mut().unwrap();
+
+                let sell_order_ref = self
+                    .orders
+                    .as_mut()
+                    .unwrap()
+                    .get_mut(&sell_order_id)
+                    .unwrap()
+                    .clone();
+
+                let mut sell_order = sell_order_ref.borrow_mut();
+                let sell_auxiliary_info = sell_order.auxiliary_info.as_mut().unwrap();
+
+                if side == "B" {
+                    buy_auxiliary_info.match_price = trade_price;
+                    buy_auxiliary_info.match_qty += qty;
+                    buy_auxiliary_info.match_seq = seq_num;
+                    buy_auxiliary_info.match_count += 1;
+
+                    sell_auxiliary_info.orderbook_price = trade_price;
+                    sell_auxiliary_info.orderbook_qty += qty;
+                    sell_auxiliary_info.orderbook_seq = seq_num;
+                } else {
+                    sell_auxiliary_info.match_price = trade_price;
+                    sell_auxiliary_info.match_qty += qty;
+                    sell_auxiliary_info.match_seq = seq_num;
+                    sell_auxiliary_info.match_count += 1;
+
+                    buy_auxiliary_info.orderbook_price = trade_price;
+                    buy_auxiliary_info.orderbook_qty += qty;
+                    buy_auxiliary_info.orderbook_seq = seq_num;
+                }
+            } else {
+                let order_ref = self.orders.as_mut().unwrap().get(&order_id).unwrap();
+                let mut order = order_ref.borrow_mut();
+                let auxiliary_info = order.auxiliary_info.as_mut().unwrap();
+                auxiliary_info.cancel_seq = seq_num;
+
+                self.index_by_seq
+                    .as_mut()
+                    .unwrap()
+                    .push_back((seq_num, order_id));
             }
         }
     }
@@ -232,96 +516,236 @@ impl DataCollator {
     /// 更新对应订单的成交数量。如果订单在 `orders` 中尚未存在，则会创建新的订单
     /// 并添加到 `orders` 和 `index_by_seq` 中。
     fn load_trade_sh(&mut self) {
-        let _bs = self.df_trade.column("TradeBSFlag").unwrap().i32().unwrap();
-        let _buy_no = self.df_trade.column("TradeBuyNo").unwrap().i64().unwrap();
-        let _sell_no = self.df_trade.column("TradeSellNo").unwrap().i64().unwrap();
-        let _type = self.df_trade.column("TradeType").unwrap().i32().unwrap();
-        let _p = self.df_trade.column("TradePrice").unwrap().f64().unwrap();
-        let _v = self.df_trade.column("TradeQty").unwrap().f64().unwrap();
-        let _mdtime = self.df_trade.column("MDTime").unwrap().i64().unwrap();
-        let _recvtime = self
+        let bs_flag_col = self
             .df_trade
-            .column("ReceiveDateTime")
+            .as_ref()
+            .unwrap()
+            .column("TradeBSFlag")
+            .unwrap()
+            .i32()
+            .unwrap();
+        let buy_no_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("TradeBuyNo")
             .unwrap()
             .i64()
             .unwrap();
-        let _seq = self.df_trade.column("ApplSeqNum").unwrap().i64().unwrap();
+        let sell_no_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("TradeSellNo")
+            .unwrap()
+            .i64()
+            .unwrap();
+        let trade_type_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("TradeType")
+            .unwrap()
+            .i32()
+            .unwrap();
+        let trade_price_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("TradePrice")
+            .unwrap()
+            .f64()
+            .unwrap();
+        let trade_qty_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("TradeQty")
+            .unwrap()
+            .f64()
+            .unwrap();
+        let md_time_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("MDTime")
+            .unwrap()
+            .i64()
+            .unwrap();
+        let seq_num_col = self
+            .df_trade
+            .as_ref()
+            .unwrap()
+            .column("ApplSeqNum")
+            .unwrap()
+            .i64()
+            .unwrap();
 
-        for idx in 0..self.df_trade.height() {
-            let buy_order_id = _buy_no.get(idx).unwrap();
-            let sell_order_id = _sell_no.get(idx).unwrap();
-            let qty = _v.get(idx).unwrap();
-            let seq = _seq.get(idx).unwrap();
-            match self.orders.get_mut(&buy_order_id) {
-                Some(order) => order.borrow_mut().qty += qty,
+        for idx in 0..self.df_trade.as_ref().unwrap().height() {
+            let buy_order_id = buy_no_col.get(idx).unwrap();
+            let sell_order_id = sell_no_col.get(idx).unwrap();
+            let qty = trade_qty_col.get(idx).unwrap();
+            let trade_price = trade_price_col.get(idx).unwrap();
+            let trade_type = OrderType::from_i32(trade_type_col.get(idx).unwrap()).unwrap();
+            let md_time = md_time_col.get(idx).unwrap();
+            let seq_num = seq_num_col.get(idx).unwrap();
+
+            let side = if bs_flag_col.get(idx).unwrap() == 1 {
+                "B"
+            } else {
+                "S"
+            };
+
+            match self.orders.as_mut().unwrap().get_mut(&buy_order_id) {
+                Some(order_ref) => {
+                    let mut order = order_ref.borrow_mut();
+                    let timestamp = order.timestamp.clone();
+                    let auxiliary_info = order.auxiliary_info.as_mut().unwrap();
+
+                    if side == "B" {
+                        auxiliary_info.match_price = trade_price;
+                        auxiliary_info.match_qty += qty;
+                        if auxiliary_info.match_seq == i64::MAX {
+                            auxiliary_info.match_seq = seq_num;
+                        }
+                        auxiliary_info.match_count += 1;
+                        if !is_in_call_auction(timestamp, MarketType::SH).unwrap_or(false) {
+                            auxiliary_info.initial_qty += qty;
+                        }
+                    } else {
+                        auxiliary_info.orderbook_price = trade_price;
+                        auxiliary_info.orderbook_qty += qty;
+                        auxiliary_info.orderbook_seq = seq_num;
+                    }
+                    print!("== buy some side = {side} , seq = {seq_num} ,  ==  {order:?}\n");
+                }
                 None => {
-                    let order_ref = Order::new_ref(
-                        None,
-                        self.stock_code.clone(),
-                        _recvtime.get(idx).unwrap(),
-                        _p.get(idx).unwrap(),
-                        _v.get(idx).unwrap(),
-                        "B",
-                        OrdType::from_i32(_type.get(idx).unwrap()).unwrap(),
+                    let order_ref = L3Order::new_ref(
                         OrderSourceType::LocalOrder,
+                        None,
+                        buy_order_id,
+                        Side::Buy,
+                        0,
+                        0,
+                        md_time,
+                        OrderType::None,
                     );
-                    order_ref.borrow_mut().order_id = buy_order_id;
-                    order_ref.borrow_mut().seq = seq;
-                    self.orders.insert(buy_order_id, order_ref);
-                    self.index_by_seq.push_back((seq, buy_order_id));
+
+                    let mut order = order_ref.borrow_mut();
+                    let auxiliary_info = order.auxiliary_info.as_mut().unwrap();
+
+                    auxiliary_info.match_price = trade_price;
+                    auxiliary_info.match_qty += qty;
+                    auxiliary_info.match_seq = seq_num;
+                    auxiliary_info.match_count += 1;
+
+                    auxiliary_info.initial_qty += qty;
+
+                    self.orders
+                        .as_mut()
+                        .unwrap()
+                        .insert(buy_order_id, order_ref.clone());
+                    print!("== buy none side = {side} , seq = {seq_num} ,  == {order:?}\n");
                 }
             }
 
-            match self.orders.get_mut(&sell_order_id) {
-                Some(order) => order.borrow_mut().qty += qty,
+            match self.orders.as_mut().unwrap().get_mut(&sell_order_id) {
+                Some(order_ref) => {
+                    let mut order = order_ref.borrow_mut();
+                    let timestamp = order.timestamp.clone();
+                    let auxiliary_info = order.auxiliary_info.as_mut().unwrap();
+
+                    if side == "S" {
+                        auxiliary_info.match_price = trade_price;
+                        auxiliary_info.match_qty += qty;
+                        if auxiliary_info.match_seq == i64::MAX {
+                            auxiliary_info.match_seq = seq_num;
+                        }
+                        auxiliary_info.match_count += 1;
+
+                        if !is_in_call_auction(timestamp, MarketType::SZ).unwrap_or(false) {
+                            auxiliary_info.initial_qty += qty;
+                        }
+                    } else {
+                        auxiliary_info.orderbook_price = trade_price;
+                        auxiliary_info.orderbook_qty += qty;
+                        auxiliary_info.orderbook_seq = seq_num;
+                    }
+                    print!("== sell some == side = {side} , seq = {seq_num} , {order:?}\n");
+                }
                 None => {
-                    let order_ref = Order::new_ref(
-                        None,
-                        self.stock_code.clone(),
-                        _recvtime.get(idx).unwrap(),
-                        _p.get(idx).unwrap(),
-                        _v.get(idx).unwrap(),
-                        "S",
-                        OrdType::from_i32(_type.get(idx).unwrap()).unwrap(),
+                    let order_ref = L3Order::new_ref(
                         OrderSourceType::LocalOrder,
+                        None,
+                        sell_order_id,
+                        Side::Sell,
+                        0,
+                        0,
+                        md_time,
+                        OrderType::None,
                     );
-                    order_ref.borrow_mut().order_id = sell_order_id;
-                    order_ref.borrow_mut().seq = seq;
-                    self.orders.insert(sell_order_id, order_ref);
-                    self.index_by_seq.push_back((seq, sell_order_id));
+
+                    let mut order = order_ref.borrow_mut();
+                    let auxiliary_info = order.auxiliary_info.as_mut().unwrap();
+
+                    auxiliary_info.match_price = trade_price;
+                    auxiliary_info.match_qty += qty;
+                    auxiliary_info.match_seq = seq_num;
+                    auxiliary_info.match_count += 1;
+
+                    auxiliary_info.initial_qty += qty;
+
+                    self.orders
+                        .as_mut()
+                        .unwrap()
+                        .insert(sell_order_id, order_ref.clone());
+                    print!("== sell none side = {side} , seq = {seq_num} , == {order:?}\n");
                 }
             }
         }
     }
 
     fn init_sz(&mut self) {
-        self.load_order();
+        self.load_order_sz();
         self.load_trade_sz();
         self.post_init();
     }
 
     fn init_sh(&mut self) {
-        self.load_order();
+        self.load_order_sh();
         self.load_trade_sh();
         self.post_init();
     }
 
     fn post_init(&mut self) {
-        self.index_by_seq.make_contiguous().sort();
-        self.len = self.index_by_seq.len();
+        for (order_id, order_ref) in self.orders.as_ref().unwrap().iter() {
+            let seq = order_ref
+                .borrow()
+                .auxiliary_info
+                .as_ref()
+                .unwrap()
+                .orderbook_seq();
+            order_ref.borrow_mut().seq = seq;
+            self.index_by_seq
+                .as_mut()
+                .unwrap()
+                .push_back((seq, order_id.clone()));
+        }
+        self.index_by_seq.as_mut().unwrap().make_contiguous().sort();
+        self.len = self.index_by_seq.as_ref().unwrap().len();
     }
 }
 
 impl OrderIter for DataCollator {
-    type Item = OrderRef;
+    type Item = L3OrderRef;
 
-    fn next(&self) -> Option<&Self::Item> {
+    fn next(&mut self) -> Option<(i64, &Self::Item)> {
         if self.is_last() {
             return None;
         }
-        let (_, order_id) = self.index_by_seq[self.current_idx];
-
-        self.orders.get(&order_id)
+        let (idx, order_id) = self.index_by_seq.as_ref().unwrap()[self.current_idx];
+        self.current_idx += 1;
+        Some((idx, self.orders.as_ref().unwrap().get(&order_id).unwrap()))
     }
 
     fn is_last(&self) -> bool {
@@ -332,7 +756,75 @@ impl OrderIter for DataCollator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 创建一个测试用的 DataCollator 实例
+    fn create_test_collator() -> DataCollator {
+        DataCollator::new(
+            "600519".to_string(),
+            "local".to_string(),
+            "path/to/data".to_string(),
+            "20240830".to_string(),
+            "ORDER",
+        )
+    }
+
+    // 测试 DataCollator 的新建
+    #[test]
+    fn test_new() {
+        let collator = create_test_collator();
+        assert_eq!(collator.exchange_code, "SH");
+        assert_eq!(collator.stock_code, "600519");
+        assert_eq!(collator.file_type, "local");
+        assert_eq!(collator.data_path, "path/to/data");
+        assert_eq!(collator.source, OrderSourceType::LocalOrder);
+    }
 
     #[test]
-    fn test_init() {}
+    fn test_new2() {
+        let exchange_mode = "backtest".to_string();
+        let stock_code = "688007.SH".to_string();
+        let file_type = "local".to_string();
+        let data_path = "./data".to_string();
+        let date = "20231201".to_string();
+        let mode = "L2P";
+
+        let mut data = DataCollator::new(stock_code, file_type, data_path, date, mode);
+        data.init();
+        print!("data len = {}\n", data.len);
+        for i in 1..=data.len {
+            print!("{:?}\n", data.next());
+        }
+        print!("data current_idx = {}\n", data.current_idx)
+    }
+
+    // // 测试初始化
+    // #[test]
+    // fn test_init() {
+    //     let mut collator = create_test_collator();
+    //     collator.init();
+    //     assert!(!collator.is_last);
+    //     assert_eq!(collator.len, collator.index_by_seq.len());
+    // }
+
+    // // 测试 load_order
+    // #[test]
+    // fn test_load_order() {
+    //     // 设置测试数据
+    //     let df_order = DataFrame::new(vec![
+    //         Series::new("OrderNO", &[1001, 1002]),
+    //         Series::new("OrderBSFlag", &[1, 0]),
+    //         Series::new("OrderType", &[1, 2]), // 假设 1 对应 L，2 对应 M
+    //         Series::new("OrderPrice", &[10.5, 20.5]),
+    //         Series::new("OrderQty", &[100.0, 200.0]),
+    //         Series::new("ReceiveDateTime", &[1234567890, 1234567900]),
+    //         Series::new("ApplSeqNum", &[1, 2]),
+    //     ])
+    //     .unwrap();
+
+    //     let mut collator = create_test_collator();
+    //     collator.df_order = df_order;
+    //     collator.load_order();
+
+    //     assert_eq!(collator.orders.len(), 2);
+    //     assert_eq!(collator.index_by_seq.len(), 2);
+    // }
 }

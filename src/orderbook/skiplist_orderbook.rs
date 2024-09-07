@@ -2,11 +2,13 @@ use super::skiplist_helper::skiplist_serde;
 use super::types::ExchangeMode;
 use super::*;
 use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
+use polars::prelude::LhsNumOps;
 use serde::{Deserialize, Serialize};
 use skiplist::SkipMap;
 use statistics::Statistics;
 use std::collections::VecDeque;
 
+use super::ValueOp;
 use std::cmp;
 use std::collections::{hash_map::Entry, HashMap};
 use std::process::id;
@@ -15,9 +17,11 @@ use std::{cell::RefCell, rc::Rc};
 /// `PriceLevel` 结构体表示市场中的一个价格层级。一个价格层级包含该价格的所有订单及其相关的状态和交易数据。
 #[derive(Serialize, Deserialize, Debug)]
 pub struct PriceLevel {
+    pub direction: Side,
     // 当前的交易模式
     pub mode: ExchangeMode,
     // 存储当前价格层级中的所有订单
+    #[serde(skip)]
     pub orders: VecDeque<Option<L3OrderRef>>,
     // 当前价格层级的总交易量
     pub vol: i64,
@@ -25,6 +29,12 @@ pub struct PriceLevel {
     pub vol_shadow: i64,
     // 当前价格层级中的订单总数
     pub count: i64,
+}
+
+impl ValueOp for PriceLevel {
+    fn get_reverse(&self) -> bool {
+        self.direction == Side::Buy
+    }
 }
 
 impl PriceLevel {
@@ -35,8 +45,9 @@ impl PriceLevel {
     ///
     /// # 返回值
     /// 返回一个新的 `PriceLevel` 实例，初始化时，订单队列为空，交易量和订单数量均为零。
-    pub fn new(mode: ExchangeMode) -> Self {
+    pub fn new(mode: ExchangeMode, side: Side) -> Self {
         Self {
+            direction: side,
             mode: mode,
             orders: VecDeque::new(),
             vol: 0,
@@ -58,11 +69,16 @@ impl PriceLevel {
         self.orders.push_back(Some(Rc::clone(&order_ref)));
         let mut order = order_ref.borrow_mut();
         order.idx = self.orders.len();
-        order.position = order.idx as i64;
-        self.vol_shadow += order.vol_shadow;
+
         if self.mode == ExchangeMode::Live || order.source == OrderSourceType::LocalOrder {
+            order.total_vol_before = self.vol;
             self.vol += order.vol;
-        }
+            self.vol_shadow += order.vol;
+        } else {
+            order.total_vol_before = self.vol_shadow;
+            self.vol_shadow += order.vol_shadow;
+        };
+
         self.count += 1;
         Ok(true)
     }
@@ -75,18 +91,25 @@ impl PriceLevel {
     ///
     /// # 返回值
     /// 如果删除成功，则返回 `Ok(true)`；如果发生错误（如订单未找到），则返回相应的 `MarketError`。
+    ///
     pub fn delete_order(&mut self, order_ref: &L3OrderRef) -> Result<bool, MarketError> {
-        // 获取订单的可变引用
-        let mut order = order_ref.borrow_mut();
+        let idx = order_ref.borrow().idx;
 
-        // 订单在 `orders` 中的索引
-        let idx = order.idx;
-
-        // 验证订单的索引是否有效
-        if idx > self.orders.len() || self.orders[idx - 1].as_ref() != Some(order_ref) {
+        if idx == 0 || idx > self.orders.len() {
             return Err(MarketError::OrderNotFound);
         }
 
+        if self.orders[idx - 1].is_none() {
+            return Ok(true);
+        } else {
+            if self.orders[idx - 1].as_ref().unwrap().borrow().order_id
+                != order_ref.borrow().order_id
+            {
+                return Err(MarketError::OrderNotFound);
+            }
+        }
+
+        let mut order = order_ref.borrow_mut();
         self.orders[order.idx - 1] = None;
 
         if self.mode == ExchangeMode::Live || order.source == OrderSourceType::LocalOrder {
@@ -106,23 +129,18 @@ impl PriceLevel {
     /// - **用户订单**（`OrderSourceType::UserOrder`）: 其位置是基于用户订单的起始索引和订单在价格层级中的实际索引来计算的。
     ///
     pub fn update_order_position(&mut self) {
-        let mut market_start: i64 = -1;
-        let mut user_start: i64 = -1;
+        let mut market_total_before: i64 = 0;
+        let mut user_total_before: i64 = 0;
         for idx in 0..self.orders.len() {
             if self.orders[idx].is_some() {
                 let mut order = self.orders[idx].as_ref().unwrap().borrow_mut();
-                if market_start == -1 {
-                    market_start = idx as i64;
-                }
 
-                if order.vol_shadow > 0 && user_start == -1 {
-                    user_start = idx as i64;
-                }
-
-                if order.source == OrderSourceType::LocalOrder {
-                    order.position = idx as i64 - market_start;
+                if order.source == OrderSourceType::LocalOrder || self.mode == ExchangeMode::Live {
+                    order.total_vol_before = market_total_before;
+                    market_total_before += order.vol;
                 } else {
-                    order.position = idx as i64 - user_start;
+                    order.total_vol_before = user_total_before;
+                    user_total_before += order.vol_shadow;
                 }
             }
         }
@@ -170,6 +188,12 @@ impl PriceLevel {
 
     pub fn shadow_match(&mut self, order_ref: L3OrderRef) -> Result<i64, MarketError> {
         let mut filled: i64 = 0;
+
+        //提前退出
+        if order_ref.borrow().source == OrderSourceType::UserOrder && self.vol_shadow == 0 {
+            return Ok(0);
+        }
+
         // 遍历当前价格层级中的所有订单
         for idx in 0..self.orders.len() {
             let other_ref = match &self.orders[idx] {
@@ -178,11 +202,13 @@ impl PriceLevel {
             };
             let mut order = order_ref.borrow_mut();
             let mut other = other_ref.borrow_mut();
-            other.dirty = true;
+
             if order.account.is_some() && other.account.is_some() && order.account == other.account
             {
                 continue;
             }
+
+            other.dirty = true;
 
             if order.source == OrderSourceType::LocalOrder {
                 if other.source == OrderSourceType::LocalOrder {
@@ -276,7 +302,7 @@ impl PriceLevel {
 
     pub fn live_match(&mut self, order_ref: L3OrderRef) -> Result<i64, MarketError> {
         let mut filled: i64 = 0;
-        for idx in 1..self.orders.len() {
+        for idx in 0..self.orders.len() {
             let other_ref = match &self.orders[idx] {
                 Some(value) => value.clone(),
                 None => continue,
@@ -284,7 +310,6 @@ impl PriceLevel {
             let mut order = order_ref.borrow_mut();
             let mut other = other_ref.borrow_mut();
 
-            // 如果两个订单的账户相同，则跳过匹配
             if order.account.is_some() && other.account.is_some() && order.account == other.account
             {
                 continue;
@@ -295,13 +320,17 @@ impl PriceLevel {
             if order.vol >= other.vol {
                 filled += other.vol;
                 order.vol -= other.vol;
+                order.vol_shadow -= other.vol_shadow;
                 other.vol = 0;
+                other.vol_shadow = 0;
                 self.orders[idx] = None;
                 self.count -= 1;
             } else {
                 filled += order.vol;
                 other.vol -= order.vol;
+                other.vol_shadow -= order.vol_shadow;
                 order.vol = 0;
+                order.vol_shadow = 0;
             }
 
             if order.vol == 0 {
@@ -309,9 +338,40 @@ impl PriceLevel {
             }
         }
         self.vol -= filled;
+        self.vol_shadow -= filled;
         Ok(filled)
     }
 }
+
+impl SnapshotOp for PriceLevel {
+    fn snapshot(&self) -> String {
+        serde_json::to_string(self).unwrap()
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct MarketDepthShadow {
+    /// 当前最佳买入价的 tick 价格。
+    pub best_bid_tick: i64,
+
+    /// 当前最佳卖出价的 tick 价格。
+    pub best_ask_tick: i64,
+
+    /// 最新交易的 tick 价格。
+    pub last_tick: i64,
+}
+
+impl MarketDepthShadow {
+    pub fn new() -> Self {
+        Self {
+            best_bid_tick: INVALID_MIN,
+            best_ask_tick: INVALID_MAX,
+            last_tick: INVALID_MIN,
+        }
+    }
+}
+
+type DepthType = SkipMap<i64, PriceLevel>;
 
 /// 表示交易工具的市场深度，使用跳表实现以高效管理订单簿。
 /// 维护订单簿的当前状态，包括买卖深度、市场统计信息和各种配置参数。
@@ -332,9 +392,9 @@ impl PriceLevel {
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SkipListMarketDepth {
     #[serde(with = "skiplist_serde")]
-    pub ask_depth: SkipMap<PriceTick, PriceLevel>,
+    pub ask_depth: DepthType,
     #[serde(with = "skiplist_serde")]
-    pub bid_depth: SkipMap<PriceTick, PriceLevel>,
+    pub bid_depth: DepthType,
     /// 工具的最小价格增量或减量。
     pub tick_size: f64,
 
@@ -353,6 +413,8 @@ pub struct SkipListMarketDepth {
     /// 最新交易的 tick 价格。
     pub last_tick: i64,
 
+    pub previous_close_tick: i64,
+
     /// 活跃订单的哈希映射，通过唯一标识符索引。
     pub orders: HashMap<OrderId, L3OrderRef>,
 
@@ -361,10 +423,17 @@ pub struct SkipListMarketDepth {
 
     /// 与市场活动相关的统计数据（例如，成交量、波动性）。
     pub market_statistics: Statistics,
+
+    pub market_shadow: Option<MarketDepthShadow>,
 }
 
 impl SkipListMarketDepth {
-    fn new(mode: ExchangeMode, tick_size: f64, lot_size: f64) -> Self {
+    pub fn new(mode: ExchangeMode, tick_size: f64, lot_size: f64) -> Self {
+        let market_shadow = match mode {
+            ExchangeMode::Backtest => Some(MarketDepthShadow::new()),
+            _ => None,
+        };
+
         Self {
             ask_depth: SkipMap::new(),
             bid_depth: SkipMap::new(),
@@ -374,18 +443,136 @@ impl SkipListMarketDepth {
             best_bid_tick: INVALID_MIN,
             best_ask_tick: INVALID_MAX,
             last_tick: INVALID_MIN,
+            previous_close_tick: 0,
             orders: HashMap::new(),
             mode: mode,
             market_statistics: Statistics::new(),
+            market_shadow: market_shadow,
         }
     }
 
-    fn statistics_mut(&mut self) -> &mut Statistics {
-        &mut self.market_statistics
+    fn delete_order(&mut self, order_ref: L3OrderRef) -> Result<(Side, i64, i64), MarketError> {
+        let side = order_ref.borrow().side.clone();
+        let price_tick = order_ref.borrow().price_tick;
+        // 根据订单的买卖方向更新相应的市场深度
+        if side == Side::Buy {
+            let prev_best_tick = self.best_bid_tick;
+
+            if let Some(price_level) = self.bid_depth.get_mut(&-price_tick) {
+                price_level.delete_order(&order_ref);
+            }
+
+            self.best_bid_tick = self.update_bid_depth().unwrap_or(prev_best_tick);
+            Ok((Side::Buy, prev_best_tick, self.best_bid_tick))
+        } else {
+            let prev_best_tick = self.best_ask_tick;
+
+            if let Some(price_level) = self.ask_depth.get_mut(&price_tick) {
+                price_level.delete_order(&order_ref);
+            }
+
+            self.best_ask_tick = self.update_ask_depth().unwrap_or(prev_best_tick);
+            Ok((Side::Sell, prev_best_tick, self.best_ask_tick))
+        }
     }
 
-    fn last_tick(&self) -> i64 {
-        self.last_tick
+    fn determine_auction_price_and_vol(&self) -> (i64, i64) {
+        let mut open_price_tick = 0;
+        let mut sells: VecDeque<(i64, i64)> = VecDeque::with_capacity(self.ask_depth.len());
+        let mut buys: VecDeque<(i64, i64)> = VecDeque::with_capacity(self.bid_depth.len());
+        // 使用 `map_or` 提供默认值 `0`
+        let max_bid_tick = self.bid_depth.front().map_or(0, |(tick, _)| tick.abs());
+        let min_ask_tick = self.ask_depth.front().map_or(0, |(tick, _)| tick.abs());
+        // 累积买盘量
+        for (tick, level) in self.bid_depth.iter() {
+            if tick.abs() < min_ask_tick {
+                break;
+            }
+            let prev_vol = buys.back().map_or(0, |&(_, vol)| vol);
+            buys.push_back((tick.abs(), prev_vol + level.vol));
+        }
+
+        // 累积卖盘量
+        for (tick, level) in self.ask_depth.iter() {
+            if tick.abs() > max_bid_tick {
+                break;
+            }
+            let prev_vol = sells.back().map_or(0, |&(_, vol)| vol);
+            sells.push_back((*tick, prev_vol + level.vol));
+        }
+
+        let mut max_vol = 0;
+        let mut min_unfilled_vol = i64::MAX;
+        let mut candidate_prices = vec![];
+
+        let mut sell_tick;
+        let mut sell_vol;
+        (sell_tick, sell_vol) = sells.pop_back().unwrap();
+        let mut buy_tick;
+        let mut buy_vol;
+
+        while !buys.is_empty() {
+            (buy_tick, buy_vol) = buys.front().unwrap().clone();
+            if buy_tick >= sell_tick {
+                // 成交量为买卖盘的最小值
+                let transacted_vol = buy_vol.min(sell_vol);
+
+                // 未成交量
+                let unfilled_buy_vol = buy_vol - transacted_vol;
+                let unfilled_sell_vol = sell_vol - transacted_vol;
+                let total_unfilled_vol = unfilled_buy_vol + unfilled_sell_vol;
+
+                if transacted_vol > max_vol
+                    || (transacted_vol == max_vol && total_unfilled_vol < min_unfilled_vol)
+                {
+                    max_vol = transacted_vol;
+                    min_unfilled_vol = total_unfilled_vol;
+                    candidate_prices.clear(); // 更新候选价格
+                    candidate_prices.push((buy_tick + sell_tick) / 2);
+                } else if transacted_vol == max_vol && total_unfilled_vol == min_unfilled_vol {
+                    candidate_prices.push((buy_tick + sell_tick) / 2);
+                }
+                buys.pop_front();
+            } else {
+                // 买盘价格低于卖盘价格，结束匹配
+                (sell_tick, sell_vol) = sells.pop_back().unwrap();
+            }
+        }
+
+        // 选择符合条件的中间价作为最终成交价格
+        if !candidate_prices.is_empty() {
+            open_price_tick = candidate_prices[candidate_prices.len() / 2];
+        }
+
+        (open_price_tick, max_vol)
+    }
+}
+
+impl SnapshotOp for SkipListMarketDepth {
+    fn snapshot(&self) -> String {
+        serde_json::to_string(self).unwrap_or("{}".to_string())
+    }
+}
+
+impl StatisticsOp for SkipListMarketDepth {
+    fn get_statistics(&self) -> &Statistics {
+        &self.market_statistics
+    }
+}
+
+impl RecoverOp for SkipListMarketDepth {
+    fn recover(&mut self) -> Result<bool, MarketError> {
+        let mut sort_by_idx: VecDeque<(usize, i64)> = VecDeque::with_capacity(1000);
+        for (_, order_ref) in self.orders.iter_mut() {
+            sort_by_idx.push_back((order_ref.borrow().idx, order_ref.borrow().order_id));
+        }
+        sort_by_idx.make_contiguous().sort();
+
+        for (_, order_id) in sort_by_idx {
+            let order_ref = self.orders.get(&order_id).unwrap();
+            let _ = self.add(order_ref.clone());
+        }
+        Ok(true)
     }
 }
 
@@ -394,16 +581,52 @@ impl MarketDepth for SkipListMarketDepth {
         Box::new(Self::new(mode, tick_size, lot_size))
     }
 
+    fn set_previous_close_tick(&mut self, previous_close_tick: i64) {
+        self.previous_close_tick = previous_close_tick;
+    }
+
+    fn get_bid_level(&self, level_num: usize) -> String {
+        let mut levels: Vec<(i64, &PriceLevel)> = Vec::with_capacity(level_num);
+        let mut count = 1;
+        for (price_tick, price_level) in &mut self.bid_depth.iter() {
+            if count > level_num {
+                break;
+            }
+            levels.push((price_tick.clone(), price_level));
+            count += 1;
+        }
+        serde_json::to_string(&levels).unwrap()
+    }
+
+    fn get_ask_level(&self, level_num: usize) -> String {
+        let mut levels: Vec<(i64, &PriceLevel)> = Vec::with_capacity(level_num);
+        let mut count = 1;
+        for (price_tick, price_level) in &mut self.ask_depth.iter() {
+            if count > level_num {
+                break;
+            }
+            levels.push((price_tick.clone(), price_level));
+            count += 1;
+        }
+        serde_json::to_string(&levels).unwrap()
+    }
+
     // 获取当前最佳买入价（以价格为单位）。
     ///
     /// 如果 `best_bid_tick` 为 `INVALID_MIN`，则返回 `NaN`，表示没有有效的买入报价。
     /// 否则，返回最佳买入价，通过将 `best_bid_tick` 转换为 `f64` 并乘以 `tick_size` 计算得到。
     #[inline(always)]
-    fn best_bid(&self) -> f64 {
-        if self.best_bid_tick == INVALID_MIN {
+    fn best_bid(&self, source: &OrderSourceType) -> f64 {
+        let best_tick = if self.market_shadow.is_some() && source == &OrderSourceType::UserOrder {
+            self.market_shadow.as_ref().unwrap().best_bid_tick
+        } else {
+            self.best_bid_tick
+        };
+
+        if best_tick == INVALID_MIN {
             f64::NAN
         } else {
-            self.best_bid_tick as f64 * self.tick_size
+            best_tick as f64 * self.tick_size
         }
     }
 
@@ -412,11 +635,17 @@ impl MarketDepth for SkipListMarketDepth {
     /// 如果 `best_ask_tick` 为 `INVALID_MAX`，则返回 `NaN`，表示没有有效的卖出报价。
     /// 否则，返回最佳卖出价，通过将 `best_ask_tick` 转换为 `f64` 并乘以 `tick_size` 计算得到。
     #[inline(always)]
-    fn best_ask(&self) -> f64 {
-        if self.best_ask_tick == INVALID_MAX {
+    fn best_ask(&self, source: &OrderSourceType) -> f64 {
+        let best_tick = if self.market_shadow.is_some() && source == &OrderSourceType::UserOrder {
+            self.market_shadow.as_ref().unwrap().best_ask_tick
+        } else {
+            self.best_ask_tick
+        };
+
+        if best_tick == INVALID_MAX {
             f64::NAN
         } else {
-            self.best_ask_tick as f64 * self.tick_size
+            best_tick as f64 * self.tick_size
         }
     }
 
@@ -424,16 +653,43 @@ impl MarketDepth for SkipListMarketDepth {
     ///
     /// 直接返回 `best_bid_tick` 的值。
     #[inline(always)]
-    fn best_bid_tick(&self) -> i64 {
-        self.best_bid_tick
+    fn best_bid_tick(&self, source: &OrderSourceType) -> i64 {
+        if self.market_shadow.is_some() && source == &OrderSourceType::UserOrder {
+            self.market_shadow.as_ref().unwrap().best_bid_tick
+        } else {
+            self.best_bid_tick
+        }
     }
 
     /// 获取当前最佳卖出价的 tick 价格。
     ///
     /// 直接返回 `best_ask_tick` 的值。
     #[inline(always)]
-    fn best_ask_tick(&self) -> i64 {
-        self.best_ask_tick
+    fn best_ask_tick(&self, source: &OrderSourceType) -> i64 {
+        if self.market_shadow.is_some() && source == &OrderSourceType::UserOrder {
+            self.market_shadow.as_ref().unwrap().best_ask_tick
+        } else {
+            self.best_ask_tick
+        }
+    }
+
+    #[inline(always)]
+    fn last_tick(&self, source: &OrderSourceType) -> i64 {
+        if self.market_shadow.is_some() && source == &OrderSourceType::UserOrder {
+            self.market_shadow.as_ref().unwrap().last_tick
+        } else {
+            self.last_tick
+        }
+    }
+
+    #[inline(always)]
+    fn last_price(&self, source: &OrderSourceType) -> f64 {
+        let last_tick = if self.market_shadow.is_some() && source == &OrderSourceType::UserOrder {
+            self.market_shadow.as_ref().unwrap().last_tick
+        } else {
+            self.last_tick
+        };
+        self.tick_size * last_tick as f64
     }
 
     /// 获取市场的最小价格增量。
@@ -469,7 +725,7 @@ impl MarketDepth for SkipListMarketDepth {
     /// 在回测模式下，返回 `vol_shadow`，否则返回实际的订单数量 `vol`。
     #[inline(always)]
     fn bid_vol_at_tick(&self, price_tick: i64) -> i64 {
-        let price_level = match self.bid_depth.get(&PriceTick::new(price_tick, true)) {
+        let price_level = match self.bid_depth.get(&-price_tick) {
             Some(level) => level,
             None => return 0,
         };
@@ -497,7 +753,7 @@ impl MarketDepth for SkipListMarketDepth {
 
     #[inline(always)]
     fn ask_vol_at_tick(&self, price_tick: i64) -> i64 {
-        let price_level = match self.ask_depth.get(&PriceTick::new(price_tick, true)) {
+        let price_level = match self.ask_depth.get(&price_tick) {
             Some(level) => level,
             None => return 0,
         };
@@ -524,15 +780,15 @@ impl MarketDepth for SkipListMarketDepth {
     ///
     /// 如果订单 ID 已存在于市场中，将返回 `MarketError::OrderIdExist`。
     fn add(&mut self, order_ref: L3OrderRef) -> Result<i64, MarketError> {
-        // 获取订单的相关信息
-        let order = order_ref.borrow();
-        let order_id = order.order_id;
-        let price_tick = order.price_tick;
-        let side = order.side;
-        let source = order.source;
+        // 获取订单的相关信息x
+
+        let order_id = order_ref.borrow().order_id;
+        let price_tick = order_ref.borrow().price_tick;
+        let side = order_ref.borrow().side;
+        let source = order_ref.borrow().source;
 
         if source == OrderSourceType::UserOrder {
-            match self.orders.entry(order_ref.borrow().order_id) {
+            match self.orders.entry(order_id) {
                 Entry::Occupied(_) => return Err(MarketError::OrderIdExist),
                 Entry::Vacant(entry) => entry.insert(order_ref.clone()),
             };
@@ -541,31 +797,35 @@ impl MarketDepth for SkipListMarketDepth {
         let mut best_tick: i64 = 0;
 
         if side == Side::Buy {
-            let price_level = match self.bid_depth.get_mut(&price_tick) {
+            let price_level = match self.bid_depth.get_mut(&-price_tick) {
                 Some(value) => value,
                 None => {
-                    self.bid_depth
-                        .insert(price_tick.clone(), PriceLevel::new(self.mode.clone()));
+                    self.bid_depth.insert(
+                        -price_tick.clone(),
+                        PriceLevel::new(self.mode.clone(), Side::Buy),
+                    );
 
-                    self.bid_depth.get_mut(&price_tick).unwrap()
+                    self.bid_depth.get_mut(&-price_tick).unwrap()
                 }
             };
 
             let _ = price_level.add_order(order_ref.clone());
-            self.best_bid_tick = cmp::max(self.best_bid_tick, price_tick.price_tick);
+            self.best_bid_tick = cmp::max(self.best_bid_tick, price_tick);
             best_tick = self.best_bid_tick.clone();
             self.market_statistics.total_bid_order += 1;
         } else {
             let price_level = match self.ask_depth.get_mut(&price_tick) {
                 Some(value) => value,
                 None => {
-                    self.ask_depth
-                        .insert(price_tick.clone(), PriceLevel::new(self.mode.clone()));
+                    self.ask_depth.insert(
+                        price_tick.clone(),
+                        PriceLevel::new(self.mode.clone(), Side::Sell),
+                    );
                     self.ask_depth.get_mut(&price_tick).unwrap()
                 }
             };
             let _ = price_level.add_order(order_ref.clone());
-            self.best_ask_tick = cmp::min(self.best_ask_tick, price_tick.price_tick);
+            self.best_ask_tick = cmp::min(self.best_ask_tick, price_tick);
             best_tick = self.best_ask_tick.clone();
             self.market_statistics.total_ask_order += 1;
         }
@@ -607,7 +867,7 @@ impl MarketDepth for SkipListMarketDepth {
         let mut count = 1;
         for (price_tick, price_level) in &mut self.bid_depth {
             if count > max_depth
-                || &order_ref.borrow().price_tick.price_tick > &price_tick.price_tick
+                || &order_ref.borrow().price_tick > &price_tick.abs()
                 || order_ref.borrow().vol == 0
             {
                 break;
@@ -616,14 +876,26 @@ impl MarketDepth for SkipListMarketDepth {
             let this_filled = price_level.match_order(order_ref.clone()).unwrap();
             filled += this_filled;
             count += 1;
-            self.last_tick = price_tick.price_tick;
+
+            let real_tick = if self.market_statistics.open_tick == 0 {
+                order_ref.borrow().price_tick
+            } else {
+                price_tick.clone()
+            };
+
+            self.last_tick = real_tick.abs();
+            if self.market_shadow.is_some()
+                && self.mode == ExchangeMode::Backtest
+                && order_ref.borrow().source == OrderSourceType::UserOrder
+            {
+                self.market_shadow.as_mut().unwrap().last_tick = real_tick.abs();
+            }
             self.market_statistics.total_bid_vol += this_filled;
-            self.market_statistics.total_bid_tick += filled * price_tick.price_tick;
-            self.market_statistics
-                .update_high_low(price_tick.price_tick);
+            self.market_statistics.total_bid_tick += filled * real_tick.abs();
+            self.market_statistics.update_high_low(real_tick.abs());
         }
 
-        self.best_bid_tick = self.update_bid_depth()?;
+        self.update_bid_depth()?;
         Ok(filled)
     }
 
@@ -649,15 +921,13 @@ impl MarketDepth for SkipListMarketDepth {
         max_depth: i64,
     ) -> Result<i64, MarketError> {
         let mut filled: i64 = 0;
-        let mut count = 0;
+        let mut count = 1;
 
         // 遍历卖方深度中的价格档位，进行订单匹配
-        for (price_tick, price_level) in &mut self.ask_depth {
-            count += 1;
-
+        for (price_tick, price_level) in self.ask_depth.iter_mut() {
             // 检查是否达到最大匹配深度，或者订单已完全成交，或者当前价格档位超过订单价格
             if count > max_depth
-                || &order_ref.borrow().price_tick.price_tick < &price_tick.price_tick
+                || order_ref.borrow().price_tick < price_tick.clone()
                 || order_ref.borrow().vol == 0
             {
                 break;
@@ -665,24 +935,77 @@ impl MarketDepth for SkipListMarketDepth {
             // 匹配当前价格档位的订单，并更新成交量
             let this_filled = price_level.match_order(order_ref.clone()).unwrap();
             filled += this_filled;
+            count += 1;
+
+            let real_tick = if self.market_statistics.open_tick == 0 {
+                order_ref.borrow().price_tick
+            } else {
+                price_tick.clone()
+            };
 
             // 更新市场统计数据
-            self.last_tick = price_tick.price_tick;
+            self.last_tick = real_tick.clone();
+            if self.market_shadow.is_some()
+                && self.mode == ExchangeMode::Backtest
+                && order_ref.borrow().source == OrderSourceType::UserOrder
+            {
+                self.market_shadow.as_mut().unwrap().last_tick = real_tick.clone();
+            }
             self.market_statistics.total_ask_vol += this_filled;
-            self.market_statistics.total_ask_tick += filled * price_tick.price_tick;
-            self.market_statistics
-                .update_high_low(price_tick.price_tick);
+            self.market_statistics.total_ask_tick += filled * real_tick;
+            self.market_statistics.update_high_low(real_tick.clone());
         }
 
-        self.best_ask_tick = self.update_ask_depth()?;
-
+        self.update_ask_depth()?;
         Ok(filled)
+    }
+
+    fn call_auction(&mut self) -> Result<(i64, i64), MarketError> {
+        let (open_tick, vol) = self.determine_auction_price_and_vol();
+        let order_ref = L3Order::new_ref(
+            OrderSourceType::LocalOrder,
+            None,
+            i64::MAX,
+            Side::Buy,
+            open_tick,
+            vol,
+            self.timestamp,
+            OrderType::L,
+        );
+        order_ref.borrow_mut().vol = vol;
+        order_ref.borrow_mut().vol_shadow = vol;
+        let fillled = self.match_order(order_ref.clone(), i64::MAX)?;
+        order_ref.borrow_mut().side = Side::Sell;
+        order_ref.borrow_mut().vol = vol;
+        order_ref.borrow_mut().vol_shadow = vol;
+        let fillled = self.match_order(order_ref.clone(), i64::MAX)?;
+
+        self.market_statistics.open_tick = open_tick;
+
+        Ok((open_tick, vol))
     }
 }
 
 impl L3MarketDepth for SkipListMarketDepth {
     type Error = MarketError;
 
+    /// 向订单簿中添加买单。
+    ///
+    /// # 参数
+    ///
+    /// - `source`: `OrderSourceType` 枚举类型，表示订单的来源。
+    /// - `account`: `Option<String>` 类型，表示账户信息。如果没有账户信息，则传入 `None`。
+    /// - `order_id`: `OrderId` 类型，表示订单的唯一标识符。
+    /// - `price`: `f64` 类型，表示订单的价格。
+    /// - `vol`: `i64` 类型，表示订单的数量。
+    /// - `timestamp`: `i64` 类型，表示订单的时间戳。
+    ///
+    /// # 返回值
+    ///
+    /// 返回 `Result<(i64, i64), Self::Error>`:
+    ///
+    /// - `Ok((prev_best_tick, best_bid_tick))`: 一个元组，包含添加该订单前的最佳买价档位 `prev_best_tick` 和添加订单后的最佳买价档位 `best_bid_tick`。
+    /// - `Err(Self::Error)`: 如果添加订单失败，返回相应的错误。
     fn add_buy_order(
         &mut self,
         source: OrderSourceType,
@@ -691,6 +1014,7 @@ impl L3MarketDepth for SkipListMarketDepth {
         price: f64,
         vol: i64,
         timestamp: i64,
+        order_type: OrderType,
     ) -> Result<(i64, i64), Self::Error> {
         let price_tick = (price / self.tick_size).round() as i64;
         let order_ref = L3OrderRef::new(RefCell::new(L3Order::new(
@@ -701,6 +1025,7 @@ impl L3MarketDepth for SkipListMarketDepth {
             price_tick,
             vol,
             timestamp,
+            order_type,
         )));
         self.add(order_ref)?;
         let prev_best_tick = self.best_bid_tick;
@@ -737,6 +1062,7 @@ impl L3MarketDepth for SkipListMarketDepth {
         price: f64,
         vol: i64,
         timestamp: i64,
+        order_type: OrderType,
     ) -> Result<(i64, i64), Self::Error> {
         // 将价格转换为价格档位
         let price_tick = (price / self.tick_size).round() as i64;
@@ -750,6 +1076,7 @@ impl L3MarketDepth for SkipListMarketDepth {
             price_tick,
             vol,
             timestamp,
+            order_type,
         )));
 
         // 尝试将订单添加到市场深度中
@@ -774,7 +1101,7 @@ impl L3MarketDepth for SkipListMarketDepth {
                     if price_level.count == 0 {
                         self.bid_depth.pop_front();
                     } else {
-                        self.best_bid_tick = price_tick.price_tick.clone();
+                        self.best_bid_tick = price_tick.abs();
                         price_level.update_order_position();
                         break;
                     }
@@ -786,20 +1113,29 @@ impl L3MarketDepth for SkipListMarketDepth {
             }
         }
 
+        if self.market_shadow.is_some() {
+            for (price_tick, price_level) in self.bid_depth.iter() {
+                if price_level.vol_shadow > 0 {
+                    self.market_shadow.as_mut().unwrap().best_bid_tick = price_tick.abs();
+                    break;
+                }
+            }
+        }
+
         Ok(self.best_bid_tick)
     }
 
-    /// 更新卖方市场深度，找出新的最佳卖价（最佳买单价格）。
-    /// 如果没有有效的卖单，最佳卖价将被设置为 `INVALID_MAX`。
+    /// 更新卖方深度（ask depth）数据，并计算最佳卖出价格。
+    ///
+    /// 该方法从卖方深度的前端开始，检查每个价格层次。如果某个价格层次的订单数量为零，则将其从深度中移除。否则，更新最佳卖出价格（`best_ask_tick`），并更新该价格层次的订单位置。如果市场阴影（`market_shadow`）存在，则更新市场阴影中的最佳卖出价格（`best_ask_tick`）。方法执行完毕后返回当前的最佳卖出价格。
     ///
     /// # 返回值
+    /// 返回一个 `Result` 类型：
+    /// - `Ok(i64)`：表示当前的最佳卖出价格。
+    /// - `Err(MarketError)`：表示操作失败的错误信息。
     ///
-    /// * `Ok(i64)` - 返回更新后的最佳卖价。
-    /// * `Err(MarketError)` - 如果在更新过程中出现错误。
-    ///
-    /// # 错误处理
-    ///
-    /// 如果深度中没有订单，最佳卖价会被设置为 `INVALID_MAX`。
+    /// # 错误
+    /// 方法可能会返回 `MarketError`，具体的错误类型取决于实现。
     fn update_ask_depth(&mut self) -> Result<i64, MarketError> {
         loop {
             match self.ask_depth.front_mut() {
@@ -809,7 +1145,7 @@ impl L3MarketDepth for SkipListMarketDepth {
                         // 如果该价格层次已经没有订单，将其移除
                         self.ask_depth.pop_front();
                     } else {
-                        self.best_ask_tick = price_tick.price_tick.clone();
+                        self.best_ask_tick = price_tick.clone();
                         price_level.update_order_position();
                         break;
                     }
@@ -821,51 +1157,33 @@ impl L3MarketDepth for SkipListMarketDepth {
             }
         }
 
+        if self.market_shadow.is_some() {
+            for (price_tick, price_level) in self.ask_depth.iter() {
+                if price_level.vol_shadow > 0 {
+                    self.market_shadow.as_mut().unwrap().best_ask_tick = price_tick.clone();
+                    break;
+                }
+            }
+        }
+
         Ok(self.best_ask_tick)
     }
 
-    /// 取消指定的订单，并更新市场的最佳买卖价位。
-    /// 如果订单被取消，返回订单的买卖方向、取消前和取消后的最佳价格。
-    ///
-    /// # 参数
-    ///
-    /// * `order_id` - 要取消的订单的 ID。
-    ///
-    /// # 返回值
-    ///
-    /// * `Ok((Side, i64, i64))` - 返回订单的买卖方向、取消前的最佳价位和取消后的最佳价位。
-    /// * `Err(MarketError::OrderNotFound)` - 如果找不到订单。
-    ///
-    /// # 错误处理
-    ///
-    /// 如果在订单取消过程中无法找到订单或更新深度失败，将返回相应的错误。
+    ///删除用户订单
     fn cancel_order(&mut self, order_id: OrderId) -> Result<(Side, i64, i64), Self::Error> {
         let order_ref = match self.orders.get_mut(&order_id) {
             Some(order) => order.clone(),
             None => return Err(MarketError::OrderNotFound),
         };
+        self.delete_order(order_ref)
+    }
 
-        let order = order_ref.borrow();
-        // 根据订单的买卖方向更新相应的市场深度
-        if order.side == Side::Buy {
-            let prev_best_tick = self.best_bid_tick;
-
-            if let Some(price_level) = self.bid_depth.get_mut(&order.price_tick) {
-                price_level.delete_order(&order_ref);
-            }
-
-            self.best_bid_tick = self.update_bid_depth().unwrap_or(prev_best_tick);
-            Ok((Side::Buy, prev_best_tick, self.best_bid_tick))
-        } else {
-            let prev_best_tick = self.best_ask_tick;
-
-            if let Some(price_level) = self.ask_depth.get_mut(&order.price_tick) {
-                price_level.delete_order(&order_ref);
-            }
-
-            self.best_ask_tick = self.update_ask_depth().unwrap_or(prev_best_tick);
-            Ok((Side::Sell, prev_best_tick, self.best_ask_tick))
-        }
+    ///删除市场订单
+    fn cancel_order_from_ref(
+        &mut self,
+        order_ref: L3OrderRef,
+    ) -> Result<(Side, i64, i64), Self::Error> {
+        self.delete_order(order_ref)
     }
 
     /// 修改指定订单的价格和数量，并更新订单簿。
@@ -910,11 +1228,11 @@ impl L3MarketDepth for SkipListMarketDepth {
         let price_tick = (price / self.tick_size).round() as i64;
         let vol = (qty / self.lot_size).round() as i64;
 
-        self.cancel_order(order_id);
-        order.price_tick.price_tick = price_tick;
+        let _ = self.cancel_order(order_id);
+        order.price_tick = price_tick;
         order.vol = vol;
         order.vol_shadow = vol;
-        self.add(order_ref.clone());
+        let _ = self.add(order_ref.clone());
         if order.side == Side::Buy {
             let prev_best_tick = self.best_bid_tick;
             Ok((Side::Buy, prev_best_tick, self.best_bid_tick))
@@ -932,6 +1250,37 @@ impl L3MarketDepth for SkipListMarketDepth {
 
     fn orders_mut(&mut self) -> &mut HashMap<OrderId, L3OrderRef> {
         &mut self.orders
+    }
+
+    fn get_orderbook_level(
+        &self,
+        bid_vec: &mut Vec<(f64, f64, i64)>,
+        ask_vec: &mut Vec<(f64, f64, i64)>,
+        max_level: i64,
+    ) {
+        // 辅助函数用于计算价格和数量，并填充到目标向量中
+        let process_depth = |depth: &DepthType, vec: &mut Vec<(f64, f64, i64)>| {
+            depth
+                .iter()
+                .take(max_level as usize)
+                .for_each(|(price_tick, level)| {
+                    let price = price_tick.abs() as f64 * self.tick_size;
+                    let qty = if self.mode == ExchangeMode::Backtest {
+                        level.vol_shadow as f64 * self.lot_size
+                    } else {
+                        level.vol as f64 * self.lot_size
+                    };
+                    if (self.mode == ExchangeMode::Backtest && level.vol_shadow > 0)
+                        || self.mode == ExchangeMode::Live
+                    {
+                        vec.push((price, qty, level.count));
+                    }
+                });
+        };
+
+        // 处理买盘和卖盘深度数据
+        process_depth(&self.bid_depth, bid_vec);
+        process_depth(&self.ask_depth, ask_vec);
     }
 }
 
@@ -951,12 +1300,19 @@ mod tests {
         order_id: OrderId,
     ) -> L3OrderRef {
         Rc::new(RefCell::new(L3Order::new(
-            source, account, order_id, side, price_tick, vol, timestamp,
+            source,
+            account,
+            order_id,
+            side,
+            price_tick,
+            vol,
+            timestamp,
+            OrderType::L,
         )))
     }
     #[test]
     fn test_add_order() {
-        let mut price_level = PriceLevel::new(ExchangeMode::Backtest);
+        let mut price_level = PriceLevel::new(ExchangeMode::Backtest, Side::Buy);
 
         let buy_order1 = create_test_order(
             OrderSourceType::LocalOrder,
@@ -998,7 +1354,7 @@ mod tests {
 
     #[test]
     fn test_delete_order_success() {
-        let mut price_level = PriceLevel::new(ExchangeMode::Live);
+        let mut price_level = PriceLevel::new(ExchangeMode::Live, Side::Buy);
 
         // Create a new order and add it to the price level
         let order_ref = create_test_order(
@@ -1029,7 +1385,7 @@ mod tests {
 
     #[test]
     fn test_delete_order_not_found() {
-        let mut price_level = PriceLevel::new(ExchangeMode::Live);
+        let mut price_level = PriceLevel::new(ExchangeMode::Live, Side::Buy);
 
         // Create an order reference but do not add it to the price level
         let order_ref = create_test_order(
@@ -1051,7 +1407,7 @@ mod tests {
 
     #[test]
     fn test_delete_order_with_shadow_vol() {
-        let mut price_level = PriceLevel::new(ExchangeMode::Backtest);
+        let mut price_level = PriceLevel::new(ExchangeMode::Backtest, Side::Buy);
 
         // Create a new order and add it to the price level
         let order_ref = create_test_order(
@@ -1089,7 +1445,7 @@ mod tests {
 
     #[test]
     fn test_shadow_match_success() {
-        let mut price_level = PriceLevel::new(ExchangeMode::Backtest);
+        let mut price_level = PriceLevel::new(ExchangeMode::Backtest, Side::Buy);
 
         // Add a matching order to the price level
         let order_ref1 = create_test_order(
@@ -1135,8 +1491,55 @@ mod tests {
     }
 
     #[test]
-    fn test_shadow_match_partial() {
-        let mut price_level = PriceLevel::new(ExchangeMode::Backtest);
+    fn test_live_match_success() {
+        let mut price_level = PriceLevel::new(ExchangeMode::Live, Side::Buy);
+
+        // Add a matching order to the price level
+        let order_ref1 = create_test_order(
+            OrderSourceType::LocalOrder,
+            Some("account1".to_string()),
+            Side::Buy,
+            100,
+            50,
+            1638390000,
+            1,
+        );
+        let order_ref2 = create_test_order(
+            OrderSourceType::LocalOrder,
+            Some("account2".to_string()),
+            Side::Buy,
+            100,
+            50,
+            1638390001,
+            2,
+        );
+        price_level.add_order(Rc::clone(&order_ref1)).unwrap();
+        price_level.add_order(Rc::clone(&order_ref2)).unwrap();
+
+        // Match the order
+        let matching_order = create_test_order(
+            OrderSourceType::LocalOrder,
+            Some("account1".to_string()),
+            Side::Sell,
+            100,
+            50,
+            1638390002,
+            3,
+        );
+        let result = price_level
+            .live_match(Rc::clone(&matching_order))
+            .unwrap();
+
+        // Verify the result
+        assert_eq!(result, 50); // The total volume matched should be 50
+        assert_eq!(price_level.count, 1); // Only one order should remain in the price level
+        assert_eq!(price_level.vol, 50); // The remaining order volume should be 50
+        assert_eq!(price_level.vol_shadow, 50); // The shadow volume should match the remaining order volume
+    }
+
+    #[test]
+    fn test_live_match_partial() {
+        let mut price_level = PriceLevel::new(ExchangeMode::Live, Side::Buy);
 
         // Add a matching order to the price level
         let order_ref1 = create_test_order(
@@ -1170,6 +1573,51 @@ mod tests {
             1638390002,
             3,
         );
+        let result = price_level.live_match(Rc::clone(&matching_order)).unwrap();
+
+        // Verify the result
+        assert_eq!(result, 20); // The total volume matched should be 20
+        assert_eq!(price_level.count, 2); 
+        assert_eq!(price_level.vol, 60); // The remaining order volume should be 60
+        assert_eq!(price_level.vol_shadow, 60); // The shadow volume should match the remaining order volume
+    }
+
+    #[test]
+    fn test_shadow_match_partial() {
+        let mut price_level = PriceLevel::new(ExchangeMode::Backtest, Side::Buy);
+
+        // Add a matching order to the price level
+        let order_ref1 = create_test_order(
+            OrderSourceType::UserOrder,
+            Some("account1".to_string()),
+            Side::Buy,
+            100,
+            50,
+            1638390000,
+            1,
+        );
+        let order_ref2 = create_test_order(
+            OrderSourceType::LocalOrder,
+            Some("account2".to_string()),
+            Side::Buy,
+            100,
+            30,
+            1638390001,
+            2,
+        );
+        price_level.add_order(Rc::clone(&order_ref1)).unwrap();
+        price_level.add_order(Rc::clone(&order_ref2)).unwrap();
+
+        // Match the order
+        let matching_order = create_test_order(
+            OrderSourceType::UserOrder,
+            Some("account3".to_string()),
+            Side::Sell,
+            100,
+            20,
+            1638390002,
+            3,
+        );
         let result = price_level
             .shadow_match(Rc::clone(&matching_order))
             .unwrap();
@@ -1183,8 +1631,8 @@ mod tests {
 
     #[test]
     fn test_price_level() {
-        let mut price_level_backtest = PriceLevel::new(ExchangeMode::Backtest);
-        let mut price_level_live = PriceLevel::new(ExchangeMode::Backtest);
+        let mut price_level_backtest = PriceLevel::new(ExchangeMode::Backtest, Side::Buy);
+        let mut price_level_live = PriceLevel::new(ExchangeMode::Backtest, Side::Buy);
 
         for i in 1..=2 {
             let order_ref = L3Order::new_ref(
@@ -1195,6 +1643,7 @@ mod tests {
                 100,
                 100,
                 1,
+                OrderType::L,
             );
             price_level_backtest.add_order(order_ref);
         }
@@ -1208,6 +1657,7 @@ mod tests {
             100,
             120,
             1,
+            OrderType::L,
         );
 
         price_level_backtest.match_order(order_ref);
@@ -1220,6 +1670,7 @@ mod tests {
             100,
             100,
             1,
+            OrderType::L,
         );
         price_level_backtest.match_order(order_ref);
         print!("{:?}\n", price_level_backtest);
@@ -1236,6 +1687,7 @@ mod tests {
             100,
             100,
             1,
+            OrderType::L,
         );
         depth.add(order_ref);
 
@@ -1248,6 +1700,7 @@ mod tests {
             100,
             90,
             1,
+            OrderType::L,
         );
         let filled = depth.match_bid_depth(order_sell.clone(), 100);
         print!("{:?}\n", depth);
@@ -1267,6 +1720,7 @@ mod tests {
                 100,
                 100,
                 1,
+                OrderType::L,
             );
 
             let _ = depth.add(order_ref);
@@ -1281,6 +1735,7 @@ mod tests {
                 110,
                 100,
                 1,
+                OrderType::L,
             );
 
             depth.add(order_ref);
@@ -1294,6 +1749,7 @@ mod tests {
             100,
             120,
             1,
+            OrderType::L,
         );
         let filled = depth.match_order(order_sell.clone(), 100);
 
@@ -1305,6 +1761,7 @@ mod tests {
             110,
             120,
             1,
+            OrderType::L,
         );
         let filled = depth.match_order(order_sell.clone(), 100);
 
@@ -1324,6 +1781,7 @@ mod tests {
                 100 + i as i64,
                 100,
                 1,
+                OrderType::L,
             );
 
             depth.add(order_ref);
@@ -1345,6 +1803,7 @@ mod tests {
                 100 + i as i64,
                 100,
                 1,
+                OrderType::L,
             );
 
             depth.add(order_ref);
@@ -1358,9 +1817,54 @@ mod tests {
             100,
             120,
             1,
+            OrderType::L,
         );
         let filled = depth.match_order(order_sell.clone(), 100);
         print!("{:?}\n", depth);
         print!("{:?}\n", depth.market_statistics);
     }
+
+    #[test]
+    fn test_snapshot() {
+        let mut depth = SkipListMarketDepth::new(ExchangeMode::Backtest, 0.01, 100.0);
+
+        for i in 0..=2 {
+            let order_ref = L3Order::new_ref(
+                OrderSourceType::LocalOrder,
+                Some("user1".to_string()),
+                i,
+                Side::Buy,
+                100 + i as i64,
+                100,
+                1,
+                OrderType::L,
+            );
+
+            depth.add(order_ref);
+        }
+
+        for i in 0..=2 {
+            let order_ref = L3Order::new_ref(
+                OrderSourceType::LocalOrder,
+                Some("user1".to_string()),
+                i,
+                Side::Sell,
+                100 + i as i64,
+                100,
+                1,
+                OrderType::L,
+            );
+
+            depth.add(order_ref);
+        }
+
+        let snapshot = depth.snapshot();
+        print!("{}\n", snapshot);
+
+        let mut new_depth: SkipListMarketDepth =
+            serde_json::from_str(&snapshot).expect("Failed to deserialize snapshot");
+        print!("{:?}\n", new_depth);
+    }
+    #[test]
+    fn test_call_auction() {}
 }

@@ -1,8 +1,12 @@
 #![allow(unused_variables)]
 mod orderbook;
+
+use std::any::Any;
 use std::cmp::Reverse;
 use std::collections::VecDeque;
+use std::ops::Neg;
 use std::process::Output;
+use std::str::FromStr;
 use std::{cell::RefCell, io};
 
 fn test1() {
@@ -183,14 +187,16 @@ enum List {
     Nil,
 }
 
+use hello_cargo::orderbook::ValueOp;
 use orderbook::order::Order;
 use orderbook::order::OrderRef;
 use orderbook::types::OrderSourceType;
-use orderbook::types::{OrdType, Side};
+use orderbook::types::{OrderType, Side};
 use orderbook::L3Order;
 use orderbook::L3OrderRef;
 use rayon::range;
 use serde::de::{self, value};
+use serde::{Deserialize, Serialize};
 
 use crate::List::{Cons, Nil};
 use std::rc::Rc;
@@ -245,8 +251,6 @@ fn refcell_test() {
 
     let b = test2::List::Cons(Rc::new(RefCell::new(3)), Rc::clone(&a));
     let c = test2::List::Cons(Rc::new(RefCell::new(4)), Rc::clone(&a));
-
-    *value.borrow_mut() += 10;
 
     println!("a after = {a:?}");
     println!("b after = {b:?}");
@@ -518,6 +522,7 @@ fn macro_test() {
 fn skip_list_test() {
     use orderbook::skiplist_helper::skiplist_serde;
     use orderbook::skiplist_orderbook::PriceLevel;
+    use orderbook::ValueOp;
     use orderbook::{L3Order, L3OrderRef};
     use ordered_float::OrderedFloat;
     use serde;
@@ -546,6 +551,12 @@ fn skip_list_test() {
     #[derive(Serialize, Deserialize, Debug)]
     struct Bucket {
         orders: LinkedList<Order>,
+    }
+
+    impl ValueOp for Bucket {
+        fn get_reverse(&self) -> bool {
+            true
+        }
     }
 
     impl Bucket {
@@ -607,7 +618,7 @@ fn skip_list_test() {
     #[derive(Serialize, Deserialize, Debug)]
     struct OrderBook {
         #[serde(with = "skiplist_serde")]
-        order_book: SkipMap<i64, Box<Bucket>>,
+        order_book: SkipMap<i64, Bucket>,
     }
 
     impl OrderBook {
@@ -617,7 +628,7 @@ fn skip_list_test() {
             }
         }
 
-        pub fn borrow_mut(&mut self) -> &mut SkipMap<i64, Box<Bucket>> {
+        pub fn borrow_mut(&mut self) -> &mut SkipMap<i64, Bucket> {
             return &mut self.order_book;
         }
     }
@@ -639,12 +650,15 @@ fn skip_list_test() {
 
     let mut map2: SkipMap<i64, i64> = SkipMap::new();
     let front = map2.front_mut();
-    print!("{:?}\n",front);
-    // for i in 1..=10 {
-    //     map2.insert(i, i + 10);
-    // }
+    print!("{:?}\n", front);
+    for i in 1..=10 {
+        map2.insert(i, i + 10);
+    }
 
-    
+    for (k, v) in map2.iter_mut() {
+        print!("{:?}, {:?}\n", k, v);
+    }
+
     // for (k, v) in &mut map2 {
     //     map2.remove(k);
     // }
@@ -747,7 +761,7 @@ fn skip_list_test() {
 }
 
 fn float_test() {
-    use orderbook::types::{OrdType, Side};
+    use orderbook::types::{OrderType, Side};
     let price: f64 = 1.253;
     let tick_size = 0.001;
     let price_tick: i64 = (price / tick_size).round() as i64;
@@ -760,8 +774,8 @@ fn float_test() {
         100.0,
         100.0,
         "s",
-        OrdType::L,
-    OrderSourceType::UserOrder,
+        OrderType::L,
+        OrderSourceType::UserOrder,
     );
     fn process_order(order: OrderRef) {
         let order2 = order.clone();
@@ -774,7 +788,7 @@ fn float_test() {
         print!(
             "refcount = {}, {:?}\n",
             Rc::strong_count(&order2),
-            order2.borrow()
+            order2.borrow(),
         );
     }
 
@@ -788,15 +802,15 @@ fn float_test() {
     //     }
     // }
     for i in 1..=10 {
-        queue.push_back(Some((i%3,i)));
+        queue.push_back(Some((i % 3, i)));
     }
 
     let mut iter = queue.iter_mut();
     loop {
         let i = iter.next();
-        if let Some(v) = i{
+        if let Some(v) = i {
             print!("{:?}\n", v);
-        }else {
+        } else {
             break;
         }
     }
@@ -817,7 +831,93 @@ fn float_test() {
     // print!("\n");
 }
 
+fn multhread_test() {
+    #[derive(Debug)]
+    struct Order {
+        pub price: i64,
+        pub qrt: i64,
+    }
+    let o1: Arc<Mutex<Order>> = Arc::new(Mutex::new(Order { price: 10, qrt: 10 }));
+    let mut o2 = o1.lock().unwrap();
+    o2.qrt = 1000;
+    print!("{:?}\n", o2.qrt);
+}
 
+fn sort_test() {
+    #[derive(Debug, Serialize, Deserialize)]
+    struct Foo {
+        price_tick: i64,
+        #[serde(skip)]
+        reverse: bool,
+    }
+
+    let mut queue: VecDeque<i64> = VecDeque::new();
+    for i in 1..=10 {
+        queue.push_back(-i);
+    }
+
+    queue.make_contiguous().sort();
+    print!("{:?}\n", queue);
+
+    print!("neg = {}\n", 5.neg());
+    print!("neg = {}\n", (-5).neg());
+}
+
+fn test_pack() {
+    // struct Tuple<...Args>(...Args);
+    // fn foo<...Args>(args: (...Args,))
+    // {
+
+    // }
+}
+
+fn test_any() {
+    #[derive(Debug)]
+    struct Foo {
+        a: i64,
+        b: i64,
+    }
+
+    fn bb(rrr: Rc<RefCell<dyn Any>>) {
+        match rrr.borrow_mut().downcast_mut::<Foo>() {
+            Some(foo) => {
+                foo.a = 100;
+                print!("{foo:?}\n")
+            }
+            None => print!("none"),
+        }
+    }
+
+    let mut a = Foo { a: 1, b: 2 };
+
+    let a_ref = Rc::new(RefCell::new(a));
+    print!("{a_ref:?}\n");
+    bb(a_ref.clone());
+    print!("{a_ref:?}\n");
+    #[derive(Debug)]
+    pub enum MarketType {
+        SH = 0,
+        SZ = 1,
+        Unknown = 255,
+    }
+    
+    impl FromStr for MarketType {
+        type Err = ();
+    
+        fn from_str(input: &str) -> Result<MarketType, Self::Err> {
+            match input.to_lowercase().as_str() {
+                "sh" | "shanghai" => Ok(MarketType::SH),
+                "sz" | "shenzhen" => Ok(MarketType::SH),
+                _ => Ok(MarketType::Unknown),
+            }
+        }
+    }
+
+    let a = MarketType::from_str("shanghai").unwrap();
+    print!("{a:?}");
+
+
+}
 
 fn main() {
     // test1();
@@ -837,5 +937,9 @@ fn main() {
     // array_test();
     // macro_test();
     // skip_list_test();
-    float_test();
+    // float_test();
+    // multhread_test();
+    // sort_test();
+    // test_pack;
+    test_any();
 }
