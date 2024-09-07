@@ -3,6 +3,7 @@ use hook::{Hook, HookType};
 
 use super::broker::Broker;
 use super::order::{Order, OrderRef};
+use super::utils::adjust_timestamp_milliseconds_i64;
 use super::*;
 use std::marker;
 use std::ops::Neg;
@@ -25,6 +26,8 @@ pub struct Exchange<MD> {
     pub latest_seq: i64,
     /// 最新的订单 ID，用于生成订单的唯一标识。
     pub latest_order_id: i64,
+    /// 全局时间
+    pub timestamp: i64,
 }
 
 unsafe impl<MD> Send for Exchange<MD> {}
@@ -51,6 +54,7 @@ where
             date: Some(data.to_string()),
             latest_seq: 0,
             latest_order_id: 0,
+            timestamp: 19700101000000000,
         }
     }
 
@@ -79,6 +83,7 @@ where
                 total_filled += filled;
                 broker.sync_order_info();
             }
+            self.timestamp = adjust_timestamp_milliseconds_i64(self.timestamp, duration)?;
         } else {
             let broker = self
                 .broker_map
@@ -229,12 +234,14 @@ where
         self.broker_map.get_mut(stock_code)
     }
 
-    pub fn get_crurent_time(&self, stock_code: &str) -> Result<i64, MarketError> {
-        if let Some(broker) = self.broker_map.get(stock_code) {
-            let timestamp = broker.get_crurent_time();
-            Ok(timestamp)
-        } else {
-            Err(MarketError::StockBrokerNotExist)
+    pub fn get_crurent_time(&self, stock_code: Option<&str>) -> Result<i64, MarketError> {
+        match stock_code {
+            Some(stock_id) => self
+                .broker_map
+                .get(stock_id)
+                .map(|broker| broker.get_current_time())
+                .ok_or(MarketError::StockBrokerNotExist),
+            None => Ok(self.timestamp),
         }
     }
 
@@ -733,7 +740,9 @@ mod tests {
         let _ = exchange.add_data(stock_code.as_str(), data);
         let start: i64 = 20231201092521355;
         let duration = time_difference_ms_i64(
-            exchange.get_crurent_time(stock_code.as_str()).unwrap_or(0),
+            exchange
+                .get_crurent_time(Some(stock_code.as_str()))
+                .unwrap_or(0),
             start,
         )
         .unwrap_or(0);

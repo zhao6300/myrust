@@ -132,7 +132,7 @@ where
         }
     }
 
-    pub fn get_crurent_time(&self) -> i64 {
+    pub fn get_current_time(&self) -> i64 {
         self.timestamp
     }
 
@@ -404,27 +404,38 @@ where
 
         result
     }
-    /// 获取指定状态的订单
+    // 获取订单信息，并根据给定的状态过滤订单。
     ///
-    /// 该方法根据订单的状态从经纪人的订单映射中提取所有匹配的订单，并将它们添加到传入的 `orders` 映射中。
+    /// 如果 `filter` 为空，则返回所有订单；如果 `filter` 不为空，则仅返回符合过滤条件的订单。
     ///
     /// # 参数
+    /// - `orders`: 一个可变的 `HashMap`，用于存储返回的订单。键为订单 ID，值为订单引用。
+    /// - `filter`: 一个包含订单状态的 `Vec`，用于过滤订单。如果为空，则返回所有订单。
     ///
-    /// * `orders` - 用于存储匹配订单的映射。方法将把符合状态的订单添加到这个映射中。
-    /// * `status` - 订单状态，用于筛选符合条件的订单。
+    /// # 备注
+    /// - 订单的状态由 `OrderStatus` 枚举定义。
+    /// - 如果 `filter` 为空，方法会遍历 `self.orders` 中的所有订单并将其插入到 `orders` 中。
+    /// - 如果 `filter` 不为空，方法会根据 `filter` 中的状态来筛选订单，并将符合条件的订单插入到 `orders` 中。
     pub fn get_orders(
         &mut self,
         orders: &mut HashMap<OrderId, OrderRef>,
         filter: &Vec<OrderStatus>,
     ) {
-        for (k, v) in self
-            .orders
-            .as_ref()
-            .unwrap()
-            .iter()
-            .filter(|&(k, v)| filter.contains(&v.borrow().status))
-        {
-            orders.insert(k.clone(), v.clone());
+        if filter.is_empty() {
+            for (k, v) in self.orders.as_ref().unwrap().iter() {
+                orders.insert(k.clone(), v.clone());
+            }
+        } else {
+            // 否则，根据 filter 过滤订单
+            for (k, v) in self
+                .orders
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|&(_, v)| filter.contains(&v.borrow().status))
+            {
+                orders.insert(k.clone(), v.clone());
+            }
         }
     }
     /// 获取最近的订单

@@ -1,10 +1,11 @@
-use super::{OrderType, OrderId, OrderSourceType, OrderStatus, Side};
-use serde::{Deserialize, Serialize};
+use super::{OrderId, OrderSourceType, OrderStatus, OrderType, Side};
+use serde::ser::{Serialize, SerializeStruct, Serializer};
+use serde::Deserialize;
 use std::cmp::{Ord, Ordering};
 use std::str::FromStr;
 use std::{cell::RefCell, rc::Rc};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 /// 表示订单的结构体
 /// 包含了订单的基本信息和状态
 pub struct Order {
@@ -16,24 +17,48 @@ pub struct Order {
     /// 交易所处理订单的时间
     /// 格式为 `20230801093939123`（年-月-日-时-分-秒-毫秒）
     pub exch_time: i64,
-    pub qty: f64,            // 订单数量
-    pub price: f64,          // 订单价格
-    pub price_tick: i64,     // 价格档位
+    pub qty: f64,   // 订单数量
+    pub price: f64, // 订单价格
+    #[serde(skip_serializing)]
+    pub price_tick: i64, // 价格档位
     pub order_type: OrderType, // 订单类型
-    pub side: Side,          // 买卖方向
+    pub side: Side, // 买卖方向
     pub status: OrderStatus, // 订单状态
     #[serde(skip_serializing)]
     pub source: OrderSourceType, // 订单来源类型
     pub account: Option<String>, // 账户信息
     #[serde(skip_serializing)]
     pub seq: i64, // 序列号
-    pub queue: f64,          // 持仓量
+    pub queue: f64, // 持仓量
     /// 和盘口成交的数量
     pub filled_qty: f64,
     /// 成交后剩余的数量
     pub left_qty: f64,
     #[serde(skip_serializing)]
     pub dirty: bool, // 数据是否被修改标志
+}
+
+impl Serialize for Order {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("Order", 11)?;
+        state.serialize_field("order_id", &self.order_id)?;
+        state.serialize_field("stock_code", &self.stock_code)?;
+        state.serialize_field("local_time", &self.local_time)?;
+        state.serialize_field("exch_time", &self.exch_time)?;
+        state.serialize_field("qty", &self.qty)?;
+        state.serialize_field("price", &self.price)?;
+        state.serialize_field("order_type", &self.order_type.to_i32())?;
+        state.serialize_field("side", &self.side.to_i32())?;
+        state.serialize_field("status", &self.status)?;
+        state.serialize_field("account", &self.account)?;
+        state.serialize_field("queue", &self.queue)?;
+        state.serialize_field("filled_qty", &self.filled_qty)?;
+        state.serialize_field("left_qty", &self.left_qty)?;
+        state.end()
+    }
 }
 
 impl Order {

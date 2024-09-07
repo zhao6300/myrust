@@ -1,4 +1,5 @@
 pub mod orderbook;
+mod snapshot_helper;
 use std::{
     sync::{mpsc, Arc, Mutex},
     thread,

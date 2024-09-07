@@ -1,18 +1,25 @@
+use depth::hook::HookType;
+use depth::RecoverOp;
 use libc::EEXIST;
 use polars::prelude::DataFrame;
 use polars::prelude::*;
 use pyo3::{self, basic::getattr, prelude::*};
 #[warn(unused_imports)]
 mod depth;
-
-use pyo3::types::{PyDict, PyList};
-
+mod snapshot_helper;
 use depth::dataloader::DataCollator;
 use depth::exchange::Exchange;
 use depth::skiplist_orderbook::SkipListMarketDepth;
-use depth::types::{ExchangeMode, OrderStatus};
+use depth::types::{ExchangeMode, MarketType, OrderStatus};
 use depth::utils::time_difference_ms_i64;
+use pyo3::types::{PyDict, PyList};
+use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
+use std::time;
+
+use snapshot_helper::*;
 use std::str::FromStr;
 use std::sync::Mutex;
 
@@ -26,7 +33,15 @@ pub struct TradeMockerRS {
     pub data_path: String,
     pub date: String,
     pub mode: String,
+    pub ob_snapshots: HashMap<String, OrderBookSnapshotRef>,
+    pub order_to_broker: HashMap<i64, String>,
+    pub need_output: bool,
+    pub orderbook_level: i32,
 }
+
+unsafe impl Send for TradeMockerRS {}
+
+unsafe impl Sync for TradeMockerRS {}
 
 #[pymethods]
 impl TradeMockerRS {
@@ -55,6 +70,9 @@ impl TradeMockerRS {
         exchange_mode: &str,
         verbose: i32,
     ) -> Self {
+        if !vec!["live", "backtest"].contains(&exchange_mode) {
+            panic!("exchange_mode must be one of [live, backtest] ");
+        }
         let exchange = Exchange::new(exchange_mode, date);
         Self {
             exchange: Arc::new(Mutex::new(exchange)),
@@ -64,6 +82,10 @@ impl TradeMockerRS {
             data_path: data_path.to_string(),
             date: date.to_string(),
             mode: mode.to_string(),
+            ob_snapshots: HashMap::new(),
+            order_to_broker: HashMap::new(),
+            need_output: need_output,
+            orderbook_level: orderbook_level,
         }
     }
 
@@ -80,11 +102,10 @@ impl TradeMockerRS {
     /// - 返回订单 ID，如果失败返回 -1。
     ///
     pub fn init(&mut self, stock_code: &str) -> bool {
-        if self.stock_code.is_none() {
+        if !self.exchange.lock().unwrap().exists_stock(stock_code) {
             self.stock_code = Some(stock_code.to_string());
 
             let mut data = DataCollator::new(
-                self.exchange_mode.clone(),
                 stock_code.to_string().clone(),
                 self.file_type.clone(),
                 self.data_path.clone(),
@@ -96,16 +117,34 @@ impl TradeMockerRS {
             let exchange_mode = ExchangeMode::from_str(self.exchange_mode.as_str())
                 .unwrap_or(ExchangeMode::Backtest);
             let mut exchange = self.exchange.lock().unwrap();
+            let market_code = data.exchange_code.clone();
+            let snapshot = Rc::new(RefCell::new(OrderBookSnapshot::new(
+                stock_code.to_string(),
+                self.date.clone(),
+                data.len,
+            )));
+            self.ob_snapshots
+                .insert(stock_code.to_string(), snapshot.clone());
+
             if let Err(e) = exchange.add_broker(
+                MarketType::from_str(market_code.as_str()).unwrap_or(MarketType::SH),
                 exchange_mode,
                 stock_type,
-                self.stock_code.as_ref().unwrap().clone(),
+                stock_code.to_string(),
                 1.0,
             ) {
                 eprintln!("Failed to add broker: {}", e);
-                false // 返回错误代码，表示添加经纪商失败
+                false
             } else {
-                let _ = exchange.add_data(self.stock_code.as_ref().unwrap(), data);
+                let _ = exchange.add_data(stock_code, data);
+                let mut hook = get_hook(snapshot.clone());
+                hook.max_level = self.orderbook_level as i64;
+                let _ = exchange.register_orderbook_hook(
+                    stock_code,
+                    HookType::Orderbook,
+                    "snapshot",
+                    hook,
+                );
                 true
             }
         } else {
@@ -132,7 +171,11 @@ impl TradeMockerRS {
             order_volume,
             bs_flag,
         ) {
-            Ok(order_id) => order_id,
+            Ok(order_id) => {
+                self.order_to_broker
+                    .insert(order_id, stock_code.to_string());
+                order_id
+            }
             Err(_) => -1,
         }
     }
@@ -145,123 +188,181 @@ impl TradeMockerRS {
     /// # 返回
     /// - 成功撤销返回 `true`。
     pub fn cancel_order(&mut self, order_number: i64) -> bool {
+        let stock_code = self.order_to_broker.get(&order_number).unwrap().clone();
+        self.order_to_broker.remove(&order_number);
         self.exchange
             .lock()
             .unwrap()
-            .cancel_order(self.stock_code.as_ref().unwrap().as_str(), order_number)
+            .cancel_order(stock_code.as_str(), order_number)
             .is_ok()
     }
 
     /// 获取待处理订单
     ///
+    /// # 参数
+    /// - `stock_code`: 可选参数，指定股票代码。如果为 `None`，则获取所有股票的待处理订单。
+    ///
     /// # 返回
-    /// - 返回以 JSON 格式表示的待处理订单列表。
-    pub fn get_pending_orders(&self) -> String {
+    /// - 以 JSON 格式返回待处理订单的列表。
+    pub fn get_pending_orders(&self, stock_code: Option<&str>) -> String {
         let mut orders = HashMap::new();
-        self.exchange.lock().unwrap().get_orders(
-            self.stock_code.as_ref().unwrap().as_str(),
+        let _ = self.exchange.lock().unwrap().get_orders(
             &mut orders,
             &vec![OrderStatus::New, OrderStatus::PartiallyFilled],
+            stock_code,
         );
         serde_json::to_string(&orders).unwrap()
     }
 
-    pub fn get_crurent_time(&self) -> i64 {
+    pub fn get_crurent_time(&self, stock_code: Option<&str>) -> i64 {
         self.exchange
             .lock()
             .unwrap()
-            .get_crurent_time(self.stock_code.as_ref().unwrap().as_str())
+            .get_crurent_time(stock_code)
             .unwrap_or(-1)
     }
 
-    /// 获取已取消订单
+    /// 获取已取消的订单
+    ///
+    /// # 参数
+    /// - `stock_code`: 可选参数，指定股票代码。如果为 `None`，则获取所有股票的已取消订单。
     ///
     /// # 返回
-    /// - 返回以 JSON 格式表示的已取消订单列表。
-    pub fn get_cancel_orders(&self) -> String {
+    /// - 以 JSON 格式返回已取消订单的列表。
+    pub fn get_cancel_orders(&self, stock_code: Option<&str>) -> String {
         let mut orders = HashMap::new();
-        self.exchange.lock().unwrap().get_orders(
-            self.stock_code.as_ref().unwrap().as_str(),
+        let _ = self.exchange.lock().unwrap().get_orders(
             &mut orders,
             &vec![OrderStatus::Canceled],
+            stock_code,
         );
         serde_json::to_string(&orders).unwrap()
     }
 
-    pub fn get_finished_order(&self) -> String {
+    /// 获取已完成的订单
+    ///
+    /// # 参数
+    /// - `stock_code`: 可选参数，指定股票代码。如果为 `None`，则获取所有股票的已完成订单。
+    ///
+    /// # 返回
+    /// - 以 JSON 格式返回已完成订单的列表。
+    pub fn get_finished_order(&self, stock_code: Option<&str>) -> String {
         let mut orders = HashMap::new();
-        self.exchange.lock().unwrap().get_orders(
-            self.stock_code.as_ref().unwrap().as_str(),
+        let _ = self.exchange.lock().unwrap().get_orders(
             &mut orders,
             &vec![OrderStatus::Filled],
+            stock_code,
         );
         serde_json::to_string(&orders).unwrap()
     }
+    /// 推进模拟交易的时间，并返回在此期间内完成的订单数量
+    ///
+    /// # 参数
+    /// - `duration`: 时间跨度，以毫秒为单位。模拟器将向前推进的时间量。
+    /// - `stock_code`: 可选参数，指定需要推进时间的股票代码。
+    ///    - 如果未指定，默认会对所有已加载的股票进行时间推进。
+    ///
+    /// # 返回
+    /// - `i64`: 返回在推进时间过程中成功完成的订单数量。
+    ///
+    /// # 详细说明
+    /// - 该函数会推进模拟器中的时间，并触发订单撮合。如果在指定时间内有订单完成（即订单状态变为 `Filled`），
+    ///   则这些订单会被计数并返回。
+    /// - 如果提供了 `stock_code`，仅会推进该股票的时间，并返回与该股票相关的完成订单数。
+    /// - 如果未提供 `stock_code`，则会对所有已加载的股票进行时间推进，并返回总的完成订单数。
+    pub fn elapse(&self, duration: i64, stock_code: Option<&str>) -> i64 {
+        let filled = self
+            .exchange
+            .lock()
+            .unwrap()
+            .elapse(duration, stock_code)
+            .unwrap_or(0);
+        filled
+    }
 
-    pub fn elapse(&self, start: i64, duration: i64) -> i64{
+    pub fn get_all_orders(&self, stock_code: Option<&str>) -> String {
+        let mut orders = HashMap::new();
+        let _ = self
+            .exchange
+            .lock()
+            .unwrap()
+            .get_orders(&mut orders, [], stock_code);
+        serde_json::to_string(&orders).unwrap()
+    }
+
+    pub fn get_latest_orders(&self, stock_code: Option<&str>) -> String {
+        let mut orders = HashMap::new();
+        let _ = self
+            .exchange
+            .lock()
+            .unwrap()
+            .get_latest_orders(&mut orders, stock_code);
+        serde_json::to_string(&orders).unwrap()
+    }
+
+    /// 按照指定的时间间隔推进市场模拟，并获取最新的订单信息。
+    ///
+    /// # 参数
+    /// - `start`: 交易开始时间，格式为 `YYYYMMDDHHMMSSmmm`（年-月-日-时-分-秒-毫秒）。
+    /// - `duration`: 需要推进的时间间隔，单位为毫秒。
+    /// - `stock_code`: 可选的股票代码。如果提供，则仅推进该股票的市场时间；如果为 `None`，则推进整个市场的时间。
+    ///
+    /// # 返回
+    /// - 返回一个以 JSON 格式表示的最新订单列表字符串。
+    ///
+    /// # 详细说明
+    /// 该函数首先获取当前的市场时间，然后计算从 `start` 到当前市场时间的时间差（毫秒），
+    /// 并将这个时间差加上 `duration` 作为实际推进的时间间隔。市场时间推进后，函数返回最新订单的 JSON 表示。
+
+    pub fn elapse_with_orders(
+        &self,
+        start: i64,
+        duration: i64,
+        stock_code: Option<&str>,
+    ) -> String {
         let current_timepoint = self
             .exchange
             .lock()
             .unwrap()
-            .get_crurent_time(self.stock_code.as_ref().unwrap().as_str())
+            .get_crurent_time(stock_code)
             .unwrap_or(0);
         let expected_duration =
             time_difference_ms_i64(current_timepoint, start).unwrap_or(0) + duration;
-        let filled = self.exchange.lock().unwrap().elapse(expected_duration);
-
-    }
-
-    pub fn get_latest_orders(&self) -> String {
-        let mut orders = HashMap::new();
-        self.exchange
-            .lock()
-            .unwrap()
-            .get_latest_orders(self.stock_code.as_ref().unwrap().as_str(), &mut orders);
-        serde_json::to_string(&orders).unwrap()
-    }
-
-    pub fn elapse_with_orders(&self, start: i64, duration: i64) -> String {
-        let current_timepoint = self
-            .exchange
-            .lock()
-            .unwrap()
-            .get_crurent_time(self.stock_code.as_ref().unwrap().as_str())
-            .unwrap_or(0);
-        let expected_duration =
-            time_difference_ms_i64(current_timepoint, start).unwrap_or(0) + duration;
-        let filled = self.exchange.lock().unwrap().elapse(expected_duration);
-        let mut orders = HashMap::new();
-        self.exchange
-            .lock()
-            .unwrap()
-            .get_latest_orders(self.stock_code.as_ref().unwrap().as_str(), &mut orders);
-        serde_json::to_string(&orders).unwrap()
+        self.elapse(expected_duration, stock_code);
+        self.get_latest_orders(stock_code)
     }
 
     pub fn match_order_util_mdtime(&mut self, mkt_clock_time: i64) -> String {
-        let filled = self.exchange.lock().unwrap().elapse(mkt_clock_time);
+        let current_time = self.get_crurent_time(None);
+        let duration = time_difference_ms_i64(current_time, mkt_clock_time).unwrap_or(0);
+        let filled = self.exchange.lock().unwrap().elapse(duration, None);
         let mut orders = HashMap::new();
-        self.exchange
+        let _ = self
+            .exchange
             .lock()
             .unwrap()
-            .get_latest_orders(self.stock_code.as_ref().unwrap().as_str(), &mut orders);
+            .get_latest_orders(&mut orders, None);
         serde_json::to_string(&orders).unwrap()
     }
 
     pub fn match_order_util_recvtime(&mut self, mkt_clock_time: i64) -> String {
-        let filled = self.exchange.lock().unwrap().elapse(mkt_clock_time);
+        let current_time = self.get_crurent_time(None);
+        let duration = time_difference_ms_i64(current_time, mkt_clock_time).unwrap_or(0);
+        let filled = self.exchange.lock().unwrap().elapse(duration, None);
         let mut orders = HashMap::new();
-        self.exchange
+        let _ = self
+            .exchange
             .lock()
             .unwrap()
-            .get_latest_orders(self.stock_code.as_ref().unwrap().as_str(), &mut orders);
+            .get_latest_orders(&mut orders, None);
         serde_json::to_string(&orders).unwrap()
     }
 
-    pub fn restore_real_orderbook(&mut self) -> bool {
-        // let result = self.exchange.restore_real_orderbook();
-        // result
-        true
+    pub fn restore_real_orderbook(&mut self, snapshot: String) -> bool {
+        let mut exchange: Exchange<SkipListMarketDepth> =
+            serde_json::from_str(&snapshot).expect("Failed to deserialize snapshot");
+        let ret = exchange.recover().unwrap_or(false);
+        ret
     }
 
     pub fn add_order_data(
@@ -323,18 +424,39 @@ impl TradeMockerRS {
     }
 
     pub fn get_current_l3_snapshot(&self, stock_code: &str) -> String {
-        let result_json = self.exchange.lock().unwrap().snapshot(stock_code);
-        result_json
+        let snapshot = self.ob_snapshots.get(stock_code);
+        if snapshot.is_none() {
+            return "{}".to_string();
+        }
+        let result = serde_json::to_string(snapshot.as_ref().unwrap()).unwrap();
+        result
     }
 
     pub fn presist_l3_data(&mut self, stock_code: &str, clean_up: Option<bool>) -> bool {
-        // let clean_up = match clean_up {
-        //     Some(n) => n,
-        //     None => true,
-        // };
-        // let result = self.exchange.presist_l3_data(stock_code, clean_up);
-        // result
-        true
+        if !self.need_output {
+            panic!("presist_l3_data Error: param need_output must be setted to ture!");
+        }
+        let sy_time_init: time::SystemTime = time::SystemTime::now();
+        let snapshot = self.ob_snapshots.get(stock_code);
+
+        if snapshot.is_none() {
+            return false;
+        }
+        let filled = self
+            .exchange
+            .lock()
+            .unwrap()
+            .elapse(24 * 3600 * 1000, Some(stock_code));
+        let result = snapshot.unwrap().as_ref().borrow().presist();
+        println!(
+            "presist l2p: {} generate and save parquet total time spend: {:?} us",
+            stock_code,
+            time::SystemTime::now()
+                .duration_since(sy_time_init)
+                .unwrap()
+                .as_micros()
+        );
+        result
     }
 }
 
@@ -410,4 +532,3 @@ fn trade_mocker_rust(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(trade_mocker_instance))?;
     Ok(())
 }
-s
