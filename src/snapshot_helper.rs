@@ -697,19 +697,27 @@ pub fn handler(
         let mut sub_bids_vol: I32ArrLvl = [0; LEVELNUM];
         let mut sub_bids_num: I32ArrLvl = [0; LEVELNUM];
 
-        for idx in 0..bid_vec.len() {
-            let (price, qty, count) = bid_vec[idx];
-            sub_bids_p[idx] = (price * 1000.0).round() / 1000.0;
-            sub_bids_vol[idx] = qty.round() as i32;
-            sub_bids_num[idx] = count as i32;
-        }
+        sub_bids_p
+            .iter_mut()
+            .zip(sub_bids_vol.iter_mut())
+            .zip(sub_bids_num.iter_mut())
+            .zip(bid_vec.iter())
+            .for_each(|(((p, vol), num), &(price, qty, count))| {
+                *p = (price * 1000.0).round() / 1000.0;
+                *vol = qty.round() as i32;
+                *num = count as i32;
+            });
 
-        for idx in 0..ask_vec.len() {
-            let (price, qty, count) = ask_vec[idx];
-            sub_asks_p[idx] = (price * 1000.0).round() / 1000.0;
-            sub_asks_vol[idx] = qty.round() as i32;
-            sub_asks_num[idx] = count as i32;
-        }
+        sub_asks_p
+            .iter_mut()
+            .zip(sub_asks_vol.iter_mut())
+            .zip(sub_asks_num.iter_mut())
+            .zip(ask_vec.iter())
+            .for_each(|(((p, vol), num), &(price, qty, count))| {
+                *p = (price * 1000.0).round() / 1000.0;
+                *vol = qty.round() as i32;
+                *num = count as i32;
+            });
 
         let msg_buy_no = order.order_id;
         let msg_sell_no = order.order_id;

@@ -249,6 +249,11 @@ pub fn is_in_call_auction(timestamp: i64, market: MarketType) -> Result<bool, Ma
     }
 }
 
+#[inline(always)]
+pub fn extract_market_code(stock_code: &str) -> &str {
+    stock_code.split('.').last().unwrap_or("SH")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

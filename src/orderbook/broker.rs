@@ -293,12 +293,20 @@ where
     }
 
     pub fn match_order_m(&mut self, order_ref: L3OrderRef) -> Result<i64, MarketError> {
-        let filled = 0;
+        order_ref.borrow_mut().price_tick = i64::MAX;
+        let filled = self.market_depth.match_order(order_ref.clone(), 5)?;
+        order_ref.borrow_mut().price_tick = 0;
         Ok(filled)
     }
 
     pub fn match_order_n(&mut self, order_ref: L3OrderRef) -> Result<i64, MarketError> {
-        let filled = 0;
+        order_ref.borrow_mut().price_tick = i64::MAX;
+        let source = order_ref.borrow().source;
+        let filled = self.market_depth.match_order(order_ref.clone(), 5)?;
+        if order_ref.borrow().vol > 0 {
+            order_ref.borrow_mut().price_tick = self.market_depth.last_tick(&source);
+            let best_tick = self.market_depth.add(order_ref)?;
+        }
         Ok(filled)
     }
 
@@ -377,8 +385,10 @@ where
         if let Some(hooks) = self.hooks.get_mut(&HookType::Orderbook) {
             for (_, hook) in hooks.iter_mut() {
                 let mut info: StatisticsInfo = StatisticsInfo::new();
-                let mut bid_orderbook_info: Vec<(f64, f64, i64)> = Vec::with_capacity(100);
-                let mut ask_orderbook_info: Vec<(f64, f64, i64)> = Vec::with_capacity(100);
+                let mut bid_orderbook_info: Vec<(f64, f64, i64)> =
+                    Vec::with_capacity(hook.max_level);
+                let mut ask_orderbook_info: Vec<(f64, f64, i64)> =
+                    Vec::with_capacity(hook.max_level);
 
                 info.from_statistics(
                     self.market_depth.get_statistics(),

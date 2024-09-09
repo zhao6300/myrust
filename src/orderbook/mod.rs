@@ -16,17 +16,16 @@ pub mod skiplist_helper;
 /// `skiplist_orderbook` 模块定义基于跳表的订单簿。
 pub mod skiplist_orderbook;
 
+pub mod depth_manager;
 /// `statistics` 模块收集和处理交易统计数据。
 pub mod statistics;
 
+pub mod dataapi;
+pub mod hook;
+pub mod prelude;
 /// `types` 模块定义系统中使用的各种类型。
 pub mod types;
-
 pub mod utils;
-
-pub mod hook;
-
-pub mod dataapi;
 use log::{debug, info};
 use order::OrderRef;
 use serde::{Deserialize, Serialize};
@@ -131,7 +130,11 @@ pub trait MarketDepth {
 
     /// 匹配订单并返回结果。
     fn match_order(&mut self, order_ref: L3OrderRef, max_depth: i64) -> Result<i64, MarketError>;
-
+    fn try_match_order(
+        &mut self,
+        order_ref: L3OrderRef,
+        max_depth: i64,
+    ) -> Result<bool, MarketError>;
     /// 匹配买入深度并返回结果。
     fn match_bid_depth(
         &mut self,
@@ -358,7 +361,7 @@ pub trait L3MarketDepth: MarketDepth {
         &self,
         bid_vec: &mut Vec<(f64, f64, i64)>,
         ask_vec: &mut Vec<(f64, f64, i64)>,
-        max_level: i64,
+        max_level: usize,
     );
 }
 
@@ -404,4 +407,10 @@ pub trait StatisticsOp {
 
 pub trait RecoverOp {
     fn recover(&mut self) -> Result<bool, MarketError>;
+}
+
+pub trait PriceLevelOp {
+    fn get_level_info(&self) -> (i64, i64, i64);
+    fn is_deleted(&self) -> bool;
+    fn set_deleted(&mut self);
 }

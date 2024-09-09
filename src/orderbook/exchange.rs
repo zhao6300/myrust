@@ -234,6 +234,22 @@ where
         self.broker_map.get_mut(stock_code)
     }
 
+    /// 获取当前时间戳。
+    ///
+    /// # 参数
+    /// - `stock_code`: 股票代码的可选值。如果提供了 `stock_code`，将返回对应券商的当前时间戳；
+    ///   如果未提供，将返回全局时间戳。
+    ///
+    /// # 返回值
+    /// 返回当前时间戳（以毫秒为单位）。
+    ///
+    /// # 错误
+    /// 如果提供的 `stock_code` 对应的券商不存在，返回 `MarketError::StockBrokerNotExist`。
+    ///
+    /// # 示例
+    /// ```rust
+    /// let current_time = exchange.get_crurent_time(Some("688007.SH"));
+    /// ```
     pub fn get_crurent_time(&self, stock_code: Option<&str>) -> Result<i64, MarketError> {
         match stock_code {
             Some(stock_id) => self
@@ -404,6 +420,26 @@ where
         Ok(broker.market_depth.ask_vol_at_tick(price_tick))
     }
 
+    /// 设置指定股票的前收盘价。
+    ///
+    /// # 参数
+    /// - `stock_code`: 要设置前收盘价的股票代码。
+    /// - `price`: 前收盘价的值，使用 `f64` 类型。
+    ///
+    /// # 返回值
+    /// 返回 `Ok(true)` 表示前收盘价已成功设置。
+    ///
+    /// # 错误
+    /// 如果提供的 `stock_code` 在 `broker_map` 中找不到对应的券商，返回 `MarketError::StockBrokerNotExist`。
+    ///
+    /// # 示例
+    /// ```rust
+    /// let result = exchange.set_prev_close_price("688007.SH", 100.50);
+    /// match result {
+    ///     Ok(true) => println!("前收盘价设置成功"),
+    ///     Err(err) => println!("设置失败: {:?}", err),
+    /// }
+    /// ```
     pub fn set_prev_close_price(
         &mut self,
         stock_code: &str,
@@ -417,6 +453,19 @@ where
         Ok(true)
     }
 
+    /// 注册一个订单簿钩子。
+    ///
+    /// # 参数
+    /// - `stock_code`: 要注册钩子的股票代码。
+    /// - `hook_type`: 钩子的类型，使用 `HookType` 枚举。
+    /// - `name`: 钩子的名称，用于标识钩子。
+    /// - `hook`: 实际的钩子实现，使用 `Hook` 类型。
+    ///
+    /// # 返回值
+    /// 返回 `Ok(true)` 表示钩子已成功注册。
+    ///
+    /// # 错误
+    /// 如果提供的 `stock_code` 在 `broker_map` 中找不到对应的券商，返回 `MarketError::StockBrokerNotExist`。
     pub fn register_orderbook_hook(
         &mut self,
         stock_code: &str,
@@ -501,6 +550,17 @@ where
         }
     }
 
+    /// 取消指定股票的订单。
+    ///
+    /// # 参数
+    /// - `stock_code`: 要取消订单的股票代码。
+    /// - `order_id`: 要取消的订单 ID。
+    ///
+    /// # 返回值
+    /// 返回 `Ok(true)` 表示订单已成功取消。
+    ///
+    /// # 错误
+    /// 如果提供的 `stock_code` 在 `broker_map` 中找不到对应的券商，返回 `MarketError::StockBrokerNotExist`。
     pub fn cancel_order(&mut self, stock_code: &str, order_id: i64) -> Result<bool, MarketError> {
         let broker = match self.broker_map.get_mut(stock_code) {
             Some(broker) => broker,

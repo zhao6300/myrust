@@ -1,5 +1,3 @@
-use depth::hook::HookType;
-use depth::RecoverOp;
 use libc::EEXIST;
 use polars::prelude::DataFrame;
 use polars::prelude::*;
@@ -7,27 +5,22 @@ use pyo3::{self, basic::getattr, prelude::*};
 #[warn(unused_imports)]
 mod depth;
 mod snapshot_helper;
-use depth::dataloader::DataCollator;
-use depth::exchange::Exchange;
-use depth::skiplist_orderbook::SkipListMarketDepth;
-use depth::types::{ExchangeMode, MarketType, OrderStatus};
-use depth::utils::time_difference_ms_i64;
+use depth::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use std::borrow::Borrow;
+use rayon::result;
+use snapshot_helper::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time;
-
-use snapshot_helper::*;
 use std::str::FromStr;
 use std::sync::Mutex;
+use std::time;
+use std::time::{Duration, Instant};
 
 /// TradeMockerRS 是一个用于模拟交易的 Rust 结构体，通过 PyO3 与 Python 进行交互。
 #[pyclass(subclass)]
 pub struct TradeMockerRS {
     pub exchange: Arc<Mutex<Exchange<SkipListMarketDepth>>>,
-    pub stock_code: Option<String>,
     pub exchange_mode: String,
     pub file_type: String,
     pub data_path: String,
@@ -42,6 +35,16 @@ pub struct TradeMockerRS {
 unsafe impl Send for TradeMockerRS {}
 
 unsafe impl Sync for TradeMockerRS {}
+
+fn measure_time<F, T>(f: F) -> (T, Duration)
+where
+    F: FnOnce() -> T,
+{
+    let start = Instant::now();
+    let result = f();
+    let elapsed = start.elapsed();
+    (result, elapsed)
+}
 
 #[pymethods]
 impl TradeMockerRS {
@@ -76,7 +79,6 @@ impl TradeMockerRS {
         let exchange = Exchange::new(exchange_mode, date);
         Self {
             exchange: Arc::new(Mutex::new(exchange)),
-            stock_code: None,
             exchange_mode: exchange_mode.to_string(),
             file_type: file_type.to_string(),
             data_path: data_path.to_string(),
@@ -103,8 +105,6 @@ impl TradeMockerRS {
     ///
     pub fn init(&mut self, stock_code: &str) -> bool {
         if !self.exchange.lock().unwrap().exists_stock(stock_code) {
-            self.stock_code = Some(stock_code.to_string());
-
             let mut data = DataCollator::new(
                 stock_code.to_string().clone(),
                 self.file_type.clone(),
@@ -159,10 +159,11 @@ impl TradeMockerRS {
         order_volume: i64,
         bs_flag: &str,
     ) -> i64 {
-        if !self.init(stock_code) {
+        let (result, elapsed) = measure_time(|| if !self.init(stock_code) { false } else { true });
+        if !result {
             return -1;
         }
-
+        print!("elapsed = {elapsed:?}\n");
         match self.exchange.lock().unwrap().send_order(
             "none",
             stock_code,
@@ -199,11 +200,8 @@ impl TradeMockerRS {
 
     /// 获取待处理订单
     ///
-    /// # 参数
-    /// - `stock_code`: 可选参数，指定股票代码。如果为 `None`，则获取所有股票的待处理订单。
-    ///
     /// # 返回
-    /// - 以 JSON 格式返回待处理订单的列表。
+    /// - 返回以 JSON 格式表示的待处理订单列表。
     pub fn get_pending_orders(&self, stock_code: Option<&str>) -> String {
         let mut orders = HashMap::new();
         let _ = self.exchange.lock().unwrap().get_orders(
@@ -222,13 +220,10 @@ impl TradeMockerRS {
             .unwrap_or(-1)
     }
 
-    /// 获取已取消的订单
-    ///
-    /// # 参数
-    /// - `stock_code`: 可选参数，指定股票代码。如果为 `None`，则获取所有股票的已取消订单。
+    /// 获取已取消订单
     ///
     /// # 返回
-    /// - 以 JSON 格式返回已取消订单的列表。
+    /// - 返回以 JSON 格式表示的已取消订单列表。
     pub fn get_cancel_orders(&self, stock_code: Option<&str>) -> String {
         let mut orders = HashMap::new();
         let _ = self.exchange.lock().unwrap().get_orders(
@@ -239,13 +234,6 @@ impl TradeMockerRS {
         serde_json::to_string(&orders).unwrap()
     }
 
-    /// 获取已完成的订单
-    ///
-    /// # 参数
-    /// - `stock_code`: 可选参数，指定股票代码。如果为 `None`，则获取所有股票的已完成订单。
-    ///
-    /// # 返回
-    /// - 以 JSON 格式返回已完成订单的列表。
     pub fn get_finished_order(&self, stock_code: Option<&str>) -> String {
         let mut orders = HashMap::new();
         let _ = self.exchange.lock().unwrap().get_orders(
@@ -255,21 +243,7 @@ impl TradeMockerRS {
         );
         serde_json::to_string(&orders).unwrap()
     }
-    /// 推进模拟交易的时间，并返回在此期间内完成的订单数量
-    ///
-    /// # 参数
-    /// - `duration`: 时间跨度，以毫秒为单位。模拟器将向前推进的时间量。
-    /// - `stock_code`: 可选参数，指定需要推进时间的股票代码。
-    ///    - 如果未指定，默认会对所有已加载的股票进行时间推进。
-    ///
-    /// # 返回
-    /// - `i64`: 返回在推进时间过程中成功完成的订单数量。
-    ///
-    /// # 详细说明
-    /// - 该函数会推进模拟器中的时间，并触发订单撮合。如果在指定时间内有订单完成（即订单状态变为 `Filled`），
-    ///   则这些订单会被计数并返回。
-    /// - 如果提供了 `stock_code`，仅会推进该股票的时间，并返回与该股票相关的完成订单数。
-    /// - 如果未提供 `stock_code`，则会对所有已加载的股票进行时间推进，并返回总的完成订单数。
+
     pub fn elapse(&self, duration: i64, stock_code: Option<&str>) -> i64 {
         let filled = self
             .exchange
@@ -278,16 +252,6 @@ impl TradeMockerRS {
             .elapse(duration, stock_code)
             .unwrap_or(0);
         filled
-    }
-
-    pub fn get_all_orders(&self, stock_code: Option<&str>) -> String {
-        let mut orders = HashMap::new();
-        let _ = self
-            .exchange
-            .lock()
-            .unwrap()
-            .get_orders(&mut orders, [], stock_code);
-        serde_json::to_string(&orders).unwrap()
     }
 
     pub fn get_latest_orders(&self, stock_code: Option<&str>) -> String {
@@ -300,19 +264,15 @@ impl TradeMockerRS {
         serde_json::to_string(&orders).unwrap()
     }
 
-    /// 按照指定的时间间隔推进市场模拟，并获取最新的订单信息。
-    ///
-    /// # 参数
-    /// - `start`: 交易开始时间，格式为 `YYYYMMDDHHMMSSmmm`（年-月-日-时-分-秒-毫秒）。
-    /// - `duration`: 需要推进的时间间隔，单位为毫秒。
-    /// - `stock_code`: 可选的股票代码。如果提供，则仅推进该股票的市场时间；如果为 `None`，则推进整个市场的时间。
-    ///
-    /// # 返回
-    /// - 返回一个以 JSON 格式表示的最新订单列表字符串。
-    ///
-    /// # 详细说明
-    /// 该函数首先获取当前的市场时间，然后计算从 `start` 到当前市场时间的时间差（毫秒），
-    /// 并将这个时间差加上 `duration` 作为实际推进的时间间隔。市场时间推进后，函数返回最新订单的 JSON 表示。
+    pub fn get_all_orders(&self, stock_code: Option<&str>) -> String {
+        let mut orders = HashMap::new();
+        let _ = self
+            .exchange
+            .lock()
+            .unwrap()
+            .get_orders(&mut orders, &vec![], stock_code);
+        serde_json::to_string(&orders).unwrap()
+    }
 
     pub fn elapse_with_orders(
         &self,

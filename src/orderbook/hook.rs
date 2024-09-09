@@ -5,7 +5,7 @@ use std::any::Any;
 pub struct Hook {
     pub object: Rc<RefCell<dyn Any>>,
     pub handler: OrderbookHook,
-    pub max_level: i64,
+    pub max_level: usize,
 }
 
 pub type OrderbookHook = fn(

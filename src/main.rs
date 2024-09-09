@@ -900,10 +900,10 @@ fn test_any() {
         SZ = 1,
         Unknown = 255,
     }
-    
+
     impl FromStr for MarketType {
         type Err = ();
-    
+
         fn from_str(input: &str) -> Result<MarketType, Self::Err> {
             match input.to_lowercase().as_str() {
                 "sh" | "shanghai" => Ok(MarketType::SH),
@@ -915,8 +915,6 @@ fn test_any() {
 
     let a = MarketType::from_str("shanghai").unwrap();
     print!("{a:?}");
-
-
 }
 
 fn main() {

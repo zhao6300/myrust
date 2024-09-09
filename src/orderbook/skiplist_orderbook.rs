@@ -3,6 +3,7 @@ use super::types::ExchangeMode;
 use super::*;
 use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
 use polars::prelude::LhsNumOps;
+use serde::de::Expected;
 use serde::{Deserialize, Serialize};
 use skiplist::SkipMap;
 use statistics::Statistics;
@@ -424,7 +425,7 @@ pub struct SkipListMarketDepth {
     /// 与市场活动相关的统计数据（例如，成交量、波动性）。
     pub market_statistics: Statistics,
 
-    pub market_shadow: Option<MarketDepthShadow>,
+    market_shadow: Option<MarketDepthShadow>,
 }
 
 impl SkipListMarketDepth {
@@ -435,8 +436,8 @@ impl SkipListMarketDepth {
         };
 
         Self {
-            ask_depth: SkipMap::new(),
-            bid_depth: SkipMap::new(),
+            ask_depth: SkipMap::with_capacity(200),
+            bid_depth: SkipMap::with_capacity(200),
             tick_size: tick_size,
             lot_size: lot_size,
             timestamp: 0,
@@ -459,7 +460,10 @@ impl SkipListMarketDepth {
             let prev_best_tick = self.best_bid_tick;
 
             if let Some(price_level) = self.bid_depth.get_mut(&-price_tick) {
-                price_level.delete_order(&order_ref);
+                price_level.delete_order(&order_ref).map_err(|err| {
+                    // 返回 MarketError::OrderDeleteFailed 错误
+                    err
+                })?;
             }
 
             self.best_bid_tick = self.update_bid_depth().unwrap_or(prev_best_tick);
@@ -468,7 +472,10 @@ impl SkipListMarketDepth {
             let prev_best_tick = self.best_ask_tick;
 
             if let Some(price_level) = self.ask_depth.get_mut(&price_tick) {
-                price_level.delete_order(&order_ref);
+                price_level.delete_order(&order_ref).map_err(|err| {
+                    // 返回 MarketError::OrderDeleteFailed 错误
+                    err
+                })?;
             }
 
             self.best_ask_tick = self.update_ask_depth().unwrap_or(prev_best_tick);
@@ -528,9 +535,21 @@ impl SkipListMarketDepth {
                     max_vol = transacted_vol;
                     min_unfilled_vol = total_unfilled_vol;
                     candidate_prices.clear(); // 更新候选价格
-                    candidate_prices.push((buy_tick + sell_tick) / 2);
+                    if buy_vol < sell_vol {
+                        candidate_prices.push(buy_tick)
+                    } else if buy_vol > sell_vol {
+                        candidate_prices.push(sell_tick)
+                    } else {
+                        candidate_prices.push((buy_tick + sell_tick) / 2);
+                    }
                 } else if transacted_vol == max_vol && total_unfilled_vol == min_unfilled_vol {
-                    candidate_prices.push((buy_tick + sell_tick) / 2);
+                    if buy_vol < sell_vol {
+                        candidate_prices.push(buy_tick)
+                    } else if buy_vol > sell_vol {
+                        candidate_prices.push(sell_tick)
+                    } else {
+                        candidate_prices.push((buy_tick + sell_tick) / 2);
+                    }
                 }
                 buys.pop_front();
             } else {
@@ -545,6 +564,84 @@ impl SkipListMarketDepth {
         }
 
         (open_price_tick, max_vol)
+    }
+
+    fn try_match_ask_depth(
+        &mut self,
+        order_ref: L3OrderRef,
+        max_depth: i64,
+    ) -> Result<bool, MarketError> {
+        let mut filled: i64 = 0;
+        let mut count = 0;
+        let order = order_ref.borrow();
+        let expected_filled = order.vol;
+        let order_price_tick = order.price_tick;
+        // 遍历卖方深度中的价格档位，进行订单匹配
+        for (price_tick, price_level) in self.ask_depth.iter_mut() {
+            count += 1;
+            // 检查是否达到最大匹配深度，或者订单已完全成交，或者当前价格档位超过订单价格
+            if count > max_depth || order_price_tick < *price_tick {
+                break;
+            }
+            // 匹配当前价格档位的订单，并更新成交量
+            let this_filled = match self.mode {
+                ExchangeMode::Backtest => {
+                    if order.source == OrderSourceType::LocalOrder {
+                        price_level.vol
+                    } else {
+                        price_level.vol_shadow
+                    }
+                }
+                _ => price_level.vol,
+            };
+            filled += this_filled;
+
+            // 提前终止循环：如果订单已经完全成交，则无需继续遍历
+            if filled >= expected_filled {
+                break;
+            }
+        }
+
+        Ok(filled >= expected_filled)
+    }
+
+    fn try_match_bid_depth(
+        &mut self,
+        order_ref: L3OrderRef,
+        max_depth: i64,
+    ) -> Result<bool, MarketError> {
+        let mut filled: i64 = 0;
+        let mut count = 0;
+        let order = order_ref.borrow();
+        let expected_filled = order.vol;
+        let order_price_tick = order.price_tick;
+        // 遍历卖方深度中的价格档位，进行订单匹配
+        for (price_tick, price_level) in self.bid_depth.iter_mut() {
+            count += 1;
+            // 检查是否达到最大匹配深度，或者订单已完全成交，或者当前价格档位超过订单价格
+            if count > max_depth || order_price_tick > *price_tick {
+                break;
+            }
+            // 匹配当前价格档位的订单，并更新成交量
+            let this_filled = match self.mode {
+                ExchangeMode::Backtest => {
+                    if order.source == OrderSourceType::LocalOrder {
+                        price_level.vol
+                    } else {
+                        price_level.vol_shadow
+                    }
+                }
+                _ => price_level.vol,
+            };
+            filled += this_filled;
+
+            // 提前终止循环：如果订单已经完全成交，则无需继续遍历
+            if filled >= expected_filled {
+                break;
+            }
+        }
+
+        Ok(filled >= expected_filled)
     }
 }
 
@@ -840,6 +937,20 @@ impl MarketDepth for SkipListMarketDepth {
             _ => return Err(MarketError::MarketSideError),
         };
         filled
+    }
+
+    fn try_match_order(
+        &mut self,
+        order_ref: L3OrderRef,
+        max_depth: i64,
+    ) -> Result<bool, MarketError> {
+        let side = order_ref.borrow().side.clone();
+        let can_match_all = match side {
+            Side::Buy => self.try_match_ask_depth(order_ref.clone(), max_depth),
+            Side::Sell => self.try_match_bid_depth(order_ref.clone(), max_depth),
+            _ => return Err(MarketError::MarketSideError),
+        };
+        can_match_all
     }
 
     /// 在买方市场深度中匹配订单，直到满足指定的最大深度或订单完全成交。
@@ -1256,39 +1367,41 @@ impl L3MarketDepth for SkipListMarketDepth {
         &self,
         bid_vec: &mut Vec<(f64, f64, i64)>,
         ask_vec: &mut Vec<(f64, f64, i64)>,
-        max_level: i64,
+        max_level: usize,
     ) {
-        // 辅助函数用于计算价格和数量，并填充到目标向量中
-        let process_depth = |depth: &DepthType, vec: &mut Vec<(f64, f64, i64)>| {
-            depth
-                .iter()
-                .take(max_level as usize)
-                .for_each(|(price_tick, level)| {
-                    let price = price_tick.abs() as f64 * self.tick_size;
-                    let qty = if self.mode == ExchangeMode::Backtest {
-                        level.vol_shadow as f64 * self.lot_size
+        let tick_size = self.tick_size;
+        let lot_size = self.lot_size;
+
+        let process_depth =
+            |depth: &DepthType, vec: &mut Vec<(f64, f64, i64)>, use_shadow: bool| {
+                for (price_tick, level) in depth.iter().take(max_level) {
+                    let price = price_tick.abs() as f64 * tick_size;
+                    let qty = if use_shadow {
+                        level.vol_shadow as f64 * lot_size
                     } else {
-                        level.vol as f64 * self.lot_size
+                        level.vol as f64 * lot_size
                     };
-                    if (self.mode == ExchangeMode::Backtest && level.vol_shadow > 0)
-                        || self.mode == ExchangeMode::Live
-                    {
+
+                    if qty > 0.0 {
                         vec.push((price, qty, level.count));
                     }
-                });
-        };
+                }
+            };
+
+        let use_shadow = self.mode == ExchangeMode::Backtest;
 
         // 处理买盘和卖盘深度数据
-        process_depth(&self.bid_depth, bid_vec);
-        process_depth(&self.ask_depth, ask_vec);
+        process_depth(&self.bid_depth, bid_vec, use_shadow);
+        process_depth(&self.ask_depth, ask_vec, use_shadow);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, HashMap};
+    use std::time::SystemTime;
     use SkipListMarketDepth;
-
     ///下面是测试PriceLevel
     fn create_test_order(
         source: OrderSourceType,
@@ -1526,9 +1639,7 @@ mod tests {
             1638390002,
             3,
         );
-        let result = price_level
-            .live_match(Rc::clone(&matching_order))
-            .unwrap();
+        let result = price_level.live_match(Rc::clone(&matching_order)).unwrap();
 
         // Verify the result
         assert_eq!(result, 50); // The total volume matched should be 50
@@ -1577,7 +1688,7 @@ mod tests {
 
         // Verify the result
         assert_eq!(result, 20); // The total volume matched should be 20
-        assert_eq!(price_level.count, 2); 
+        assert_eq!(price_level.count, 2);
         assert_eq!(price_level.vol, 60); // The remaining order volume should be 60
         assert_eq!(price_level.vol_shadow, 60); // The shadow volume should match the remaining order volume
     }
@@ -1867,4 +1978,94 @@ mod tests {
     }
     #[test]
     fn test_call_auction() {}
+    #[test]
+    fn test_depth_performance() {
+        let mut depth = SkipListMarketDepth::new(ExchangeMode::Backtest, 0.01, 1.0);
+        let max_num: usize = 100;
+        for i in 0..=max_num {
+            let order_ref = L3Order::new_ref(
+                OrderSourceType::LocalOrder,
+                None,
+                i as i64,
+                Side::Buy,
+                100 + i as i64,
+                100,
+                1,
+                OrderType::L,
+            );
+
+            let _ = depth.add(order_ref);
+        }
+
+        for i in 0..=max_num {
+            let order_ref = L3Order::new_ref(
+                OrderSourceType::LocalOrder,
+                None,
+                i as i64,
+                Side::Sell,
+                100 + i as i64,
+                100,
+                1,
+                OrderType::L,
+            );
+
+            let _ = depth.add(order_ref);
+        }
+
+        let mut bid_orderbook_info: Vec<(f64, f64, i64)> = Vec::with_capacity(max_num);
+        let mut ask_orderbook_info: Vec<(f64, f64, i64)> = Vec::with_capacity(max_num);
+
+        depth.get_orderbook_level(&mut bid_orderbook_info, &mut ask_orderbook_info, max_num);
+    }
+
+    #[test]
+    fn test_skiplist_performance() {
+        let max_num = 100;
+        let mut map: SkipMap<i64, i64> = SkipMap::with_capacity(200);
+        let mut hashmap: HashMap<i64, i64> = HashMap::new();
+        let mut btreemap: BTreeMap<i64, i64> = BTreeMap::new();
+
+        let mut vv: Vec<i64> = Vec::with_capacity(max_num * 3);
+
+        let mut vvv: Vec<i64> = Vec::with_capacity(max_num);
+        // 初始化数据
+        for i in 1..=max_num {
+            let key = i as i64;
+            let value = key + 100;
+            map.insert(key, value);
+            hashmap.insert(key, value);
+            btreemap.insert(key, value);
+            vvv.push(key);
+        }
+
+        // 通用的性能测试函数
+        fn measure_performance<T: Iterator<Item = (i64, i64)>>(
+            name: &str,
+            iter: T,
+            vv: &mut Vec<i64>,
+        ) {
+            let start_time = SystemTime::now();
+            vv.clear(); // 清空向量
+            vv.extend(iter.map(|(_, num)| num.abs())); // 将数据插入到向量中
+            let elapsed = start_time.elapsed().expect("Time went backwards");
+            println!("{} elapsed time: {:?}", name, elapsed);
+        }
+
+        // 分别测试 SkipMap、HashMap 和 BTreeMap
+        measure_performance(
+            "skipmap",
+            map.iter().map(|(idx, num)| (*idx, *num)),
+            &mut vv,
+        );
+        measure_performance(
+            "hashmap",
+            hashmap.iter().map(|(idx, num)| (*idx, *num)),
+            &mut vv,
+        );
+        measure_performance(
+            "btreemap",
+            btreemap.iter().map(|(idx, num)| (*idx, *num)),
+            &mut vv,
+        );
+    }
 }
