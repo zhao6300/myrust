@@ -358,6 +358,7 @@ where
     pub fn process_order(&mut self, l3order_ref: L3OrderRef) -> Result<i64, MarketError> {
         let source = l3order_ref.borrow().source;
         let result;
+        l3order_ref.borrow_mut().timestamp = self.timestamp;
         if source == OrderSourceType::LocalOrder {
             result = self.process_local_order(l3order_ref.clone());
         } else {
@@ -546,6 +547,7 @@ where
                 continue;
             }
             let mut order = order_ref.borrow_mut();
+            order.exch_time = self.timestamp;
             let vol = (order.qty / self.lot_size).round() as i64;
             let l3order_ref = L3Order::new_ref(
                 order.source.clone(),
@@ -592,7 +594,7 @@ where
             );
             order.seq = self.generate_seq_number();
             let fillid = self.process_order(l3order_ref)?;
-
+            order.exch_time = self.timestamp;
             if fillid > 0 {
                 order.filled_qty = fillid as f64 * self.lot_size;
                 self.dirty_tracker.push(order.order_id);
