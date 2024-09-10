@@ -28,10 +28,10 @@ pub struct Order {
     pub account: Option<String>, // 账户信息
     #[serde(skip_serializing)]
     pub seq: i64, // 序列号
-    pub queue: f64, // 持仓量
-    /// 和盘口成交的数量
+    pub queue: f64, // 排队量
+    /// 已成交的数量
     pub filled_qty: f64,
-    /// 成交后剩余的数量
+    /// 剩余未成交的数量
     pub left_qty: f64,
     #[serde(skip_serializing)]
     pub dirty: bool, // 数据是否被修改标志

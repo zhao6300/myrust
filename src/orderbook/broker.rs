@@ -329,6 +329,15 @@ where
         }
     }
 
+    /// 处理 `OrderType::L` 订单（普通限价订单）。
+    ///
+    /// 使用无限价格档位尝试匹配订单，如果未完全成交，将订单添加到市场深度中。
+    ///
+    /// # 参数
+    /// - `order_ref`: 订单的引用，用于获取和修改订单信息。
+    ///
+    /// # 返回值
+    /// - `Result<i64, MarketError>`: 返回实际成交量，如果操作失败，返回 `Err(MarketError)`。
     pub fn match_order_l(&mut self, order_ref: L3OrderRef) -> Result<i64, MarketError> {
         let filled = self.market_depth.match_order(order_ref.clone(), i64::MAX)?;
         if order_ref.borrow().vol > 0 {
@@ -338,13 +347,34 @@ where
         Ok(filled)
     }
 
+    /// 处理 `OrderType::M` 订单（最优五档即时成交剩余撤销的市价订单）。
+    ///
+    /// 设置订单的价格为无限价格档位，尝试在市场深度中匹配订单，最多匹配五档价格。如果未完全成交，剩余部分订单将被撤销。
+    ///
+    /// # 参数
+    /// - `order_ref`: 订单的引用，用于获取和修改订单信息。
+    ///
+    /// # 返回值
+    /// - `Result<i64, MarketError>`: 返回实际成交量，如果操作失败，返回 `Err(MarketError)`。
     pub fn match_order_m(&mut self, order_ref: L3OrderRef) -> Result<i64, MarketError> {
         order_ref.borrow_mut().price_tick = i64::MAX;
         let filled = self.market_depth.match_order(order_ref.clone(), 5)?;
         order_ref.borrow_mut().price_tick = 0;
+        if order_ref.borrow().vol > 0 {
+            order_ref.borrow_mut().side = Side::None;
+        }
         Ok(filled)
     }
 
+    /// 处理 `OrderType::N` 订单（最优五档即时成交剩余转限价的市价订单）。
+    ///
+    /// 设置订单的价格为无限价格档位，尝试在市场深度中匹配订单，最多匹配五档价格。若有剩余部分，将其以上次成交价格加入市场深度。
+    ///
+    /// # 参数
+    /// - `order_ref`: 订单的引用，用于获取和修改订单信息。
+    ///
+    /// # 返回值
+    /// - `Result<i64, MarketError>`: 返回实际成交量，如果操作失败，返回 `Err(MarketError)`。
     pub fn match_order_n(&mut self, order_ref: L3OrderRef) -> Result<i64, MarketError> {
         order_ref.borrow_mut().price_tick = i64::MAX;
         let source = order_ref.borrow().source;
@@ -403,8 +433,18 @@ where
     }
 
     pub fn match_order_d(&mut self, order_ref: L3OrderRef) -> Result<i64, MarketError> {
-        let filled = 0;
-        Ok(filled)
+        order_ref.borrow_mut().price_tick = i64::MAX;
+        let is_fullfilled = self
+            .market_depth
+            .try_match_order(order_ref.clone(), i64::MAX)?;
+
+        if is_fullfilled {
+            let filled = self.market_depth.match_order(order_ref.clone(), i64::MAX)?;
+            Ok(filled)
+        } else {
+            order_ref.borrow_mut().side = Side::None;
+            Ok(0)
+        }
     }
 
     /// 处理订单
@@ -423,7 +463,6 @@ where
         let source = l3order_ref.borrow().source;
         let result;
         l3order_ref.borrow_mut().timestamp = self.timestamp;
-
         if source == OrderSourceType::LocalOrder {
             result = self.process_local_order(l3order_ref.clone());
         } else {
@@ -642,18 +681,9 @@ where
             let _ = self.goto(timestamp.clone());
             let mut order = order_ref.borrow_mut();
             let vol = (order.qty / self.lot_size).round() as i64;
-            let l3order_ref = L3Order::new_ref(
-                order.source.clone(),
-                order.account.clone(),
-                order.order_id,
-                order.side.clone(),
-                order.price_tick.clone(),
-                vol,
-                order.local_time,
-                order.order_type,
-            );
+            let l3order_ref = order.to_l3order_ref(self.tick_size, self.lot_size);
             order.seq = self.generate_seq_number();
-            let fillid = self.process_order(l3order_ref)?;
+            let fillid = self.process_order(l3order_ref.clone())?;
             order.exch_time = self.timestamp;
             if fillid > 0 {
                 order.filled_qty = fillid as f64 * self.lot_size;
