@@ -1,10 +1,9 @@
-use super::{OrderId, OrderSourceType, OrderStatus, OrderType, Side};
+use super::{L3Order, L3OrderRef, OrderId, OrderSourceType, OrderStatus, OrderType, Side};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use serde::Deserialize;
 use std::cmp::{Ord, Ordering};
 use std::str::FromStr;
 use std::{cell::RefCell, rc::Rc};
-
 #[derive(Debug, Deserialize)]
 /// 表示订单的结构体
 /// 包含了订单的基本信息和状态
@@ -113,6 +112,28 @@ impl Order {
             timestamp,
             source,
         )))
+    }
+
+    pub fn to_l3order_ref(&self, tick_size: f64, lot_size: f64) -> L3OrderRef {
+        let vol = (self.qty / lot_size).round() as i64;
+        let l30order_ref = L3Order::new_ref(
+            self.source.clone(),
+            self.account.clone(),
+            self.order_id,
+            self.side.clone(),
+            self.price_tick.clone(),
+            vol,
+            self.local_time,
+            self.order_type,
+        );
+        if self.source == OrderSourceType::LocalOrder {
+            let mut order = l30order_ref.borrow_mut();
+            let mut auxiliary_info = order.auxiliary_info.as_mut().unwrap();
+            auxiliary_info.initial_price = self.price;
+            auxiliary_info.initial_qty = self.qty;
+            auxiliary_info.initial_seq = self.seq;
+        }
+        l30order_ref
     }
 
     pub fn update(&mut self) {

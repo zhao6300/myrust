@@ -687,7 +687,7 @@ pub fn handler(
         let last_price = info.last_price;
         let high_price = info.high;
         let low_price = info.low;
-        let total_turnover = info.total_bid + info.total_ask;
+        let total_turnover = ((info.total_bid + info.total_ask)*1000.0).round()/1000.0;
         let total_volume = (info.total_bid_qty + info.total_ask_qty).round() as i32;
         let prev_close_price = info.prev_close_price;
         let mut sub_asks_p: F64ArrLvl = [0.0; LEVELNUM];

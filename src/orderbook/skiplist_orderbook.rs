@@ -392,8 +392,10 @@ type DepthType = SkipMap<i64, PriceLevel>;
 /// - `market_statistics`: 与市场活动相关的统计数据
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SkipListMarketDepth {
+    /// 卖盘深度信息，使用跳表结构进行序列化和反序列化。
     #[serde(with = "skiplist_serde")]
     pub ask_depth: DepthType,
+    /// 买盘深度信息，使用跳表结构进行序列化和反序列化。
     #[serde(with = "skiplist_serde")]
     pub bid_depth: DepthType,
     /// 工具的最小价格增量或减量。
@@ -414,6 +416,7 @@ pub struct SkipListMarketDepth {
     /// 最新交易的 tick 价格。
     pub last_tick: i64,
 
+    /// 前一交易日的收盘价，用 tick 价格表示。
     pub previous_close_tick: i64,
 
     /// 活跃订单的哈希映射，通过唯一标识符索引。
@@ -425,6 +428,7 @@ pub struct SkipListMarketDepth {
     /// 与市场活动相关的统计数据（例如，成交量、波动性）。
     pub market_statistics: Statistics,
 
+    /// 市场深度的影子副本，用于某些特殊场景的市场深度处理。
     market_shadow: Option<MarketDepthShadow>,
 }
 
@@ -455,6 +459,7 @@ impl SkipListMarketDepth {
     fn delete_order(&mut self, order_ref: L3OrderRef) -> Result<(Side, i64, i64), MarketError> {
         let side = order_ref.borrow().side.clone();
         let price_tick = order_ref.borrow().price_tick;
+        order_ref.borrow_mut().dirty = true;
         // 根据订单的买卖方向更新相应的市场深度
         if side == Side::Buy {
             let prev_best_tick = self.best_bid_tick;
@@ -483,6 +488,19 @@ impl SkipListMarketDepth {
         }
     }
 
+    /// 计算集合竞价阶段的开盘价和最大成交量。
+    ///
+    /// 该方法通过遍历买盘和卖盘的深度数据，根据集合竞价的规则，计算出符合条件的开盘价格和最大成交量。
+    ///
+    /// # 返回值
+    /// 返回一个元组，其中包含：
+    ///
+    /// - `open_price_tick`：计算出的开盘价，使用 tick 单位表示。
+    /// - `max_vol`：集合竞价阶段的最大成交量。
+    ///  # 集合竞价规则
+    /// 1. 成交量最大化：选择能够实现最大成交量的价格。
+    /// 2. 未成交量最小化：在最大成交量相同的情况下，选择未成交量最小的价格。
+    /// 3. 中间价优先：如果存在多个候选价格，选择中间价作为最终的开盘价。
     fn determine_auction_price_and_vol(&self) -> (i64, i64) {
         let mut open_price_tick = 0;
         let mut sells: VecDeque<(i64, i64)> = VecDeque::with_capacity(self.ask_depth.len());
@@ -529,6 +547,7 @@ impl SkipListMarketDepth {
                 let unfilled_sell_vol = sell_vol - transacted_vol;
                 let total_unfilled_vol = unfilled_buy_vol + unfilled_sell_vol;
 
+                // 根据成交量和未成交量更新候选价格和最大成交量
                 if transacted_vol > max_vol
                     || (transacted_vol == max_vol && total_unfilled_vol < min_unfilled_vol)
                 {
@@ -551,9 +570,9 @@ impl SkipListMarketDepth {
                         candidate_prices.push((buy_tick + sell_tick) / 2);
                     }
                 }
+                // 如果买盘价格低于卖盘价格，则继续处理下一个卖盘
                 buys.pop_front();
             } else {
-                // 买盘价格低于卖盘价格，结束匹配
                 (sell_tick, sell_vol) = sells.pop_back().unwrap();
             }
         }
@@ -565,6 +584,31 @@ impl SkipListMarketDepth {
 
         (open_price_tick, max_vol)
     }
+
+    /// 尝试在卖方深度中匹配给定的订单，并确定订单是否已全部成交。
+    ///
+    /// 该函数遍历卖方深度中的价格档位，尝试与给定的订单进行匹配，并更新订单的成交量。
+    /// 如果订单的成交量达到预期值，则返回 `Ok(true)`，否则返回 `Ok(false)`。
+    ///
+    /// # 参数
+    /// - `order_ref`: 引用一个 `L3OrderRef`，表示待匹配的订单。
+    /// - `max_depth`: 最大匹配深度，表示在卖方深度中最多遍历的价格档位数量。
+    ///
+    /// # 返回值
+    /// 返回一个 `Result<bool, MarketError>`:
+    /// - `Ok(true)` 表示订单已全部成交。
+    /// - `Ok(false)` 表示订单未能全部成交。
+    /// - 如果发生错误，返回 `Err(MarketError)`。
+    ///
+    /// # 详细说明
+    /// 1. 遍历卖方深度：函数遍历卖方深度中的每个价格档位，并尝试与订单进行匹配。
+    /// 2. 匹配深度限制：如果遍历的价格档位数量超过 `max_depth`，或者订单价格小于当前档位的价格，
+    ///    则停止匹配过程。
+    /// 3. 成交量计算：根据订单的来源和当前交易模式，选择适当的成交量字段进行匹配，并更新已成交的总量。
+    /// 4. 提前终止：如果订单已完全成交，则提前终止匹配过程。
+    ///
+    /// # 错误处理
+    /// 如果匹配过程中发生错误（例如引用的订单不存在），则返回 `Err(MarketError)`。
 
     fn try_match_ask_depth(
         &mut self,

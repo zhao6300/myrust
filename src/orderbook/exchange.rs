@@ -511,6 +511,7 @@ where
         order_price: f64,
         order_volume: i64,
         bs_flag: &str,
+        order_type: Option<OrderType>,
     ) -> Result<OrderId, MarketError> {
         // 生成新的订单 ID
         let order_id = self.generate_order_num();
@@ -530,7 +531,7 @@ where
             _ => Some(acc.to_string()),
         };
         // 创建订单
-        let order_type = OrderType::L; // 默认订单类型
+        let order_type = order_type.unwrap_or(OrderType::L); // 默认订单类型
         let order = Order::new_ref(
             account,
             stock_code.to_string(),
@@ -682,6 +683,7 @@ mod tests {
             150.0,
             10,
             "buy",
+            None,
         );
         assert!(result.is_ok());
         let order_id = result.unwrap();
@@ -707,6 +709,7 @@ mod tests {
             150.0,
             10,
             "buy",
+            None,
         );
         assert!(result.is_err());
     }
@@ -731,6 +734,7 @@ mod tests {
                 150.0,
                 10,
                 "buy",
+                None,
             )
             .unwrap();
         let result = exchange.cancel_order("AAPL", 1); // 使用之前生成的订单 ID

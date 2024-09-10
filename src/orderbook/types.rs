@@ -37,6 +37,15 @@ impl Side {
         }
     }
 
+    pub fn opposite(&self) -> Side {
+        match self {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+            Side::None => Side::None,
+            Side::Unsupported => Side::Unsupported,
+        }
+    }
+
     /// 将 `Side` 转换为对应的 `i32` 值
     ///
     /// # 返回

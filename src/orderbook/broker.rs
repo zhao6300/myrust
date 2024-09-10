@@ -3,13 +3,10 @@ use utils::should_call_auction_on_close;
 use super::dataloader::DataCollator;
 use super::*;
 
-use core::time;
 use std::{
     cmp,
     collections::{hash_map::Entry, HashMap, VecDeque},
     fmt::Debug,
-    io::Cursor,
-    thread::sleep_ms,
 };
 
 use super::utils::{adjust_timestamp_milliseconds_i64, is_in_call_auction};
@@ -23,12 +20,15 @@ use super::statistics::StatisticsInfo;
 pub struct Broker<MD> {
     /// 交易模式，例如回测模式或实时模式
     pub mode: ExchangeMode,
+    /// 市场类型，例如股票市场、期货市场等。
     pub market_type: MarketType,
     /// 股票类型，例如普通股或基金
     pub stock_type: String,
     /// 股票代码
     pub stock_code: String,
+    ///开盘价
     pub open_tick: i64,
+    ///收盘价
     pub close_tick: i64,
     /// 市场深度
     pub market_depth: Box<MD>,
@@ -38,6 +38,7 @@ pub struct Broker<MD> {
     pub tick_size: f64,
     /// 最小交易单位
     pub lot_size: f64,
+    /// 前一交易日的收盘价。
     pub previous_close_price: f64,
     /// 当前时间戳
     pub timestamp: i64,
@@ -55,6 +56,8 @@ pub struct Broker<MD> {
     /// 脏订单跟踪器
     #[serde(skip)]
     pub dirty_tracker: Vec<OrderId>,
+    /// 钩子（hooks），用于在特定事件发生时执行自定义逻辑。
+    /// 这里使用 `HookType` 作为键，`Hook` 表示钩子函数，`String` 用于标识钩子的唯一性
     #[serde(skip)]
     pub hooks: HashMap<HookType, HashMap<String, Hook>>,
 }
@@ -123,7 +126,9 @@ where
     }
 
     pub fn remove_hook(&mut self, name: &str) {
-        // self.hooks.remove(name);
+        for hooks in self.hooks.values_mut() {
+            hooks.remove(name);
+        }
     }
 
     pub fn init(&mut self) {
@@ -134,6 +139,10 @@ where
 
     pub fn get_current_time(&self) -> i64 {
         self.timestamp
+    }
+
+    pub fn set_current_time(&mut self, timestamp: i64) {
+        self.timestamp = timestamp
     }
 
     pub fn snapshot(&self) -> String {
@@ -186,101 +195,138 @@ where
         let match_vol = (auxiliary_info.match_qty / self.lot_size).round() as i64;
         let orderbook_vol = (auxiliary_info.orderbook_qty / self.lot_size).round() as i64;
         let initial_vol = (auxiliary_info.initial_qty / self.lot_size).round() as i64;
-        info!(" -- order seq = {seq} , {order_ref:?} --\n");
-        if auxiliary_info.cancel_seq == seq {
-            // print!(
-            //     "== before cancel {:?}\n",
-            //     self.market_depth.get_bid_level(1)
-            // );
-            // print!(
-            //     "== before cancel {:?}\n",
-            //     self.market_depth.get_ask_level(1)
-            // );
 
-            let _ = self.cancel_order_from_ref(order_ref.clone());
-            // print!("== after cancel {:?}\n", self.market_depth.get_bid_level(1));
-            // print!("== after cancel {:?}\n", self.market_depth.get_ask_level(1));
-        } else {
-            if in_call_auction {
-                let mut order = order_ref.borrow_mut();
-                order.price_tick = (auxiliary_info.initial_price / self.tick_size).round() as i64;
-                order.vol = initial_vol;
-                order.vol_shadow = order.vol;
-                drop(order);
-                let _ = self.market_depth.add(order_ref.clone())?;
+        if self.mode == ExchangeMode::Live {
+            let price_tick = if match_vol > 0 {
+                (auxiliary_info.match_price / self.tick_size).round() as i64
+            } else if orderbook_vol > 0 {
+                (auxiliary_info.orderbook_price / self.tick_size).round() as i64
             } else {
-                if match_vol > 0 {
-                    // print!("== before match {:?}\n", self.market_depth.get_bid_level(1));
-                    // print!("== before match {:?}\n", self.market_depth.get_ask_level(1));
-                    let mut order = order_ref.borrow_mut();
-                    order.price_tick = (auxiliary_info.match_price / self.tick_size).round() as i64;
-                    order.vol = initial_vol;
-                    order.vol_shadow = order.vol;
-                    drop(order);
-                    filled = self.market_depth.match_order(order_ref.clone(), i64::MAX)?;
+                (auxiliary_info.initial_price / self.tick_size).round() as i64
+            };
+            let mut order = order_ref.borrow_mut();
+            order.price_tick = price_tick;
+            order.vol = initial_vol;
+            order.vol_shadow = order.vol;
+            drop(order);
+            filled = self.market_depth.match_order(order_ref.clone(), i64::MAX)?;
+            if filled != initial_vol {
+                self.market_depth.add(order_ref.clone());
+            }
+        } else {
+            // print!(" -- order seq = {seq} , {order_ref:?} --\n");
+            if auxiliary_info.cancel_seq == seq {
+                // print!(
+                //     "== before cancel {:?}\n",
+                //     self.market_depth.get_bid_level(1)
+                // );
+                // print!(
+                //     "== before cancel {:?}\n",
+                //     self.market_depth.get_ask_level(1)
+                // );
 
-                    if orderbook_vol > 0 {
-                        order_ref.borrow_mut().price_tick =
-                            (auxiliary_info.orderbook_price / self.tick_size).round() as i64;
-
-                        let _ = self.market_depth.add(order_ref.clone())?;
-                    }
-
-                    // if filled != match_vol {
-                    //     print!(" ====== filled {filled} shoud be equel to match_vol {match_vol} ======\n");
-                    // }
-                    // print!("== after match  {:?}\n", self.market_depth.get_bid_level(1));
-                    // print!("== after match  {:?}\n", self.market_depth.get_ask_level(1));
-                } else if orderbook_vol > 0 {
-                    //尝试去匹配用户订单，因为没有历史成交不代表不可能和用户的订单成交
-                    // print!(
-                    //     ">> before orderbook {:?}\n",
-                    //     self.market_depth.get_bid_level(1)
-                    // );
-                    // print!(
-                    //     ">> befeor orderbook  {:?}\n",
-                    //     self.market_depth.get_ask_level(1)
-                    // );
+                let _ = self.cancel_order_from_ref(order_ref.clone());
+                // print!("== after cancel {:?}\n", self.market_depth.get_bid_level(1));
+                // print!("== after cancel {:?}\n", self.market_depth.get_ask_level(1));
+            } else {
+                if in_call_auction {
                     let mut order = order_ref.borrow_mut();
-                    order.price_tick =
-                        (auxiliary_info.orderbook_price / self.tick_size).round() as i64;
-                    order.vol = initial_vol;
-                    order.vol_shadow = order.vol;
-                    drop(order);
-                    filled = self.market_depth.match_order(order_ref.clone(), i64::MAX)?;
-                    let _ = self.market_depth.add(order_ref.clone())?;
-                    // if filled > 0 {
-                    //     print!("----- orderbook filled {filled}\n");
-                    // }
-                    // print!(
-                    //     ">> after orderbook {:?}\n",
-                    //     self.market_depth.get_bid_level(1)
-                    // );
-                    // print!(
-                    //     ">> after orderbook  {:?}\n",
-                    //     self.market_depth.get_ask_level(1)
-                    // );
-                } else {
-                    let mut order = order_ref.borrow_mut();
-                    // print!("++ before other {:?}\n", self.market_depth.get_bid_level(1));
-                    // print!("++ before other {:?}\n", self.market_depth.get_ask_level(1));
                     order.price_tick =
                         (auxiliary_info.initial_price / self.tick_size).round() as i64;
-                    order.vol = (auxiliary_info.initial_qty / self.lot_size).round() as i64;
+                    order.vol = initial_vol;
                     order.vol_shadow = order.vol;
                     drop(order);
-                    filled = self.market_depth.match_order(order_ref.clone(), i64::MAX)?;
                     let _ = self.market_depth.add(order_ref.clone())?;
-                    // if filled > 0 {
-                    //     print!("----- other filled {filled}\n");
-                    // }
-                    // print!("++ after other {:?}\n", self.market_depth.get_bid_level(1));
-                    // print!("++ after other {:?}\n", self.market_depth.get_ask_level(1));
+                } else {
+                    if match_vol > 0 {
+                        // print!("== before match {:?}\n", self.market_depth.get_bid_level(1));
+                        // print!("== before match {:?}\n", self.market_depth.get_ask_level(1));
+                        let mut order = order_ref.borrow_mut();
+                        order.price_tick =
+                            (auxiliary_info.match_price / self.tick_size).round() as i64;
+                        order.vol = initial_vol;
+                        order.vol_shadow = order.vol;
+                        drop(order);
+                        filled = self.market_depth.match_order(order_ref.clone(), i64::MAX)?;
+
+                        if orderbook_vol > 0 {
+                            order_ref.borrow_mut().price_tick =
+                                (auxiliary_info.orderbook_price / self.tick_size).round() as i64;
+
+                            let _ = self.market_depth.add(order_ref.clone())?;
+                        }
+
+                        // if filled != match_vol {
+                        //     print!(" ====== filled {filled} shoud be equel to match_vol {match_vol} ======\n");
+                        // }
+                        // print!("== after match  {:?}\n", self.market_depth.get_bid_level(1));
+                        // print!("== after match  {:?}\n", self.market_depth.get_ask_level(1));
+                    } else if orderbook_vol > 0 {
+                        //尝试去匹配用户订单，因为没有历史成交不代表不可能和用户的订单成交
+                        // print!(
+                        //     ">> before orderbook {:?}\n",
+                        //     self.market_depth.get_bid_level(1)
+                        // );
+                        // print!(
+                        //     ">> befeor orderbook  {:?}\n",
+                        //     self.market_depth.get_ask_level(1)
+                        // );
+                        let mut order = order_ref.borrow_mut();
+                        order.price_tick =
+                            (auxiliary_info.orderbook_price / self.tick_size).round() as i64;
+                        order.vol = initial_vol;
+                        order.vol_shadow = order.vol;
+                        drop(order);
+                        filled = self.market_depth.match_order(order_ref.clone(), i64::MAX)?;
+                        let _ = self.market_depth.add(order_ref.clone())?;
+                        // if filled > 0 {
+                        //     print!("----- orderbook filled {filled}\n");
+                        // }
+                        // print!(
+                        //     ">> after orderbook {:?}\n",
+                        //     self.market_depth.get_bid_level(1)
+                        // );
+                        // print!(
+                        //     ">> after orderbook  {:?}\n",
+                        //     self.market_depth.get_ask_level(1)
+                        // );
+                    } else {
+                        let mut order = order_ref.borrow_mut();
+                        // print!("++ before other {:?}\n", self.market_depth.get_bid_level(1));
+                        // print!("++ before other {:?}\n", self.market_depth.get_ask_level(1));
+                        order.price_tick =
+                            (auxiliary_info.initial_price / self.tick_size).round() as i64;
+                        order.vol = (auxiliary_info.initial_qty / self.lot_size).round() as i64;
+                        order.vol_shadow = order.vol;
+                        drop(order);
+                        filled = self.market_depth.match_order(order_ref.clone(), i64::MAX)?;
+                        let _ = self.market_depth.add(order_ref.clone())?;
+                        // if filled > 0 {
+                        //     print!("----- other filled {filled}\n");
+                        // }
+                        // print!("++ after other {:?}\n", self.market_depth.get_bid_level(1));
+                        // print!("++ after other {:?}\n", self.market_depth.get_ask_level(1));
+                    }
                 }
             }
         }
 
         Ok(filled)
+    }
+
+    /// 根据订单方向和来源获取最佳价格。
+    ///
+    /// # 参数
+    /// - `side`: 订单的买卖方向。
+    /// - `source`: 订单的来源。
+    ///
+    /// # 返回值
+    /// - `i64`: 最佳价格。
+    fn get_best_tick(&self, side: &Side, source: &OrderSourceType) -> i64 {
+        match side {
+            Side::Buy => self.market_depth.best_bid_tick(source),
+            _ => self.market_depth.best_ask_tick(source),
+        }
     }
 
     pub fn match_order_l(&mut self, order_ref: L3OrderRef) -> Result<i64, MarketError> {
@@ -310,31 +356,49 @@ where
         Ok(filled)
     }
 
+    /// 处理 `OrderType::B` 订单（以本方最优价格申报的市价订单）。
+    ///
+    /// 设置订单价格为市场深度中的最佳买价或卖价，并尝试将订单加入市场深度。
+    ///
+    /// # 参数
+    /// - `order_ref`: 订单的引用，用于获取和修改订单信息。
+    ///
+    /// # 返回值
+    /// - `Result<i64, MarketError>`: 操作成功返回 `Ok(0)`，失败返回 `Err(MarketError>`。
     pub fn match_order_b(&mut self, order_ref: L3OrderRef) -> Result<i64, MarketError> {
-        let mut order = order_ref.borrow_mut();
-        if order.side == Side::Buy {
-            order.price_tick = self.market_depth.best_bid_tick(&order.source);
-        } else {
-            order.price_tick = self.market_depth.best_ask_tick(&order.source);
+        let side = order_ref.borrow().side;
+        let source = order_ref.borrow().source;
+        let vol = order_ref.borrow().vol;
+        order_ref.borrow_mut().price_tick = self.get_best_tick(&side, &source);
+
+        if vol > 0 {
+            self.market_depth.add(order_ref.clone())?;
         }
-        // let filled = self.market_depth.match_order(order_ref.clone(), i64::MAX)?;
-        if order_ref.borrow().vol > 0 {
-            let best_tick = self.market_depth.add(order_ref.clone())?;
-        }
+
         Ok(0)
     }
 
+    /// 处理 `OrderType::C` 订单（以对手方最优价格申报的市价订单）。
+    ///
+    /// 设置订单价格为市场深度中的最佳卖价或买价，并尝试将订单匹配到市场深度中。
+    ///
+    /// # 参数
+    /// - `order_ref`: 订单的引用，用于获取和修改订单信息。
+    ///
+    /// # 返回值
+    /// - `Result<i64, MarketError>`: 返回实际成交量。
     pub fn match_order_c(&mut self, order_ref: L3OrderRef) -> Result<i64, MarketError> {
-        let mut order = order_ref.borrow_mut();
-        if order.side == Side::Buy {
-            order.price_tick = self.market_depth.best_ask_tick(&order.source);
-        } else {
-            order.price_tick = self.market_depth.best_bid_tick(&order.source);
-        }
+        let side = order_ref.borrow().side;
+        let source = order_ref.borrow().source;
+        let vol = order_ref.borrow().vol;
+        order_ref.borrow_mut().price_tick = self.get_best_tick(&side.opposite(), &source);
+
         let filled = self.market_depth.match_order(order_ref.clone(), i64::MAX)?;
-        if order_ref.borrow().vol > 0 {
-            let best_tick = self.market_depth.add(order_ref.clone())?;
+
+        if vol > 0 {
+            self.market_depth.add(order_ref.clone())?;
         }
+
         Ok(filled)
     }
 
@@ -359,28 +423,34 @@ where
         let source = l3order_ref.borrow().source;
         let result;
         l3order_ref.borrow_mut().timestamp = self.timestamp;
+
         if source == OrderSourceType::LocalOrder {
             result = self.process_local_order(l3order_ref.clone());
         } else {
-            let order_type = l3order_ref.borrow().order_type;
-
-            result = match order_type {
-                // 处理普通限价订单
-                OrderType::L => self.match_order_l(l3order_ref.clone()),
-                // 处理最优五档即时成交剩余撤销的市价订单
-                OrderType::M => self.match_order_m(l3order_ref.clone()),
-                // 处理最优五档即时成交剩余转限价的市价订单
-                OrderType::N => self.match_order_n(l3order_ref.clone()),
-                // 处理以本方最优价格申报的市价订单
-                OrderType::B => self.match_order_b(l3order_ref.clone()),
-                // 处理以对手方最优价格申报的市价订单
-                OrderType::C => self.match_order_c(l3order_ref.clone()),
-                // 处理市价全额成交或撤销订单
-                OrderType::D => self.match_order_d(l3order_ref.clone()),
-                // 处理取消委托
-                OrderType::Cancel => self.cancel_order(l3order_ref.borrow().order_id),
-                _ => Err(MarketError::OrderTypeUnsupported),
-            };
+            if is_in_call_auction(self.timestamp, self.market_type).unwrap_or(false) {
+                let _ = self.market_depth.add(l3order_ref.clone());
+                result = Ok(0);
+            } else {
+                let order_type = l3order_ref.borrow().order_type;
+                let order_id = l3order_ref.borrow().order_id;
+                result = match order_type {
+                    // 处理普通限价订单
+                    OrderType::L => self.match_order_l(l3order_ref.clone()),
+                    // 处理最优五档即时成交剩余撤销的市价订单
+                    OrderType::M => self.match_order_m(l3order_ref.clone()),
+                    // 处理最优五档即时成交剩余转限价的市价订单
+                    OrderType::N => self.match_order_n(l3order_ref.clone()),
+                    // 处理以本方最优价格申报的市价订单
+                    OrderType::B => self.match_order_b(l3order_ref.clone()),
+                    // 处理以对手方最优价格申报的市价订单
+                    OrderType::C => self.match_order_c(l3order_ref.clone()),
+                    // 处理市价全额成交或撤销订单
+                    OrderType::D => self.match_order_d(l3order_ref.clone()),
+                    // 处理取消委托
+                    OrderType::Cancel => self.cancel_order(order_id),
+                    _ => Err(MarketError::OrderTypeUnsupported),
+                };
+            }
         }
 
         if let Some(hooks) = self.hooks.get_mut(&HookType::Orderbook) {
@@ -548,17 +618,7 @@ where
             }
             let mut order = order_ref.borrow_mut();
             order.exch_time = self.timestamp;
-            let vol = (order.qty / self.lot_size).round() as i64;
-            let l3order_ref = L3Order::new_ref(
-                order.source.clone(),
-                order.account.clone(),
-                order.order_id,
-                order.side.clone(),
-                order.price_tick.clone(),
-                vol,
-                order.local_time,
-                order.order_type,
-            );
+            let l3order_ref = order.to_l3order_ref(self.tick_size, self.lot_size);
             let fillid = self.process_order(l3order_ref)?;
             if fillid > 0 {
                 order.filled_qty = fillid as f64 * self.lot_size;
@@ -625,8 +685,10 @@ where
                 .get(order_id)
                 .unwrap()
                 .borrow_mut();
+            // print!("{l30order:?}\n");
             if l30order.borrow().dirty == true {
                 // 同步订单的位置信息和数量
+                order.price = l30order.borrow().price_tick as f64 * self.tick_size;
                 order.queue = l30order.borrow().total_vol_before as f64 * self.lot_size;
                 order.left_qty = l30order.borrow().vol as f64 * self.lot_size;
                 order.filled_qty = order.qty - order.left_qty;
@@ -737,10 +799,6 @@ where
     /// * 如果操作成功，返回 `Ok(0)`。
     /// * 如果找不到订单或在取消市场深度中的订单时发生错误，返回 `Err(MarketError)`。
     pub fn cancel_order(&mut self, order_id: OrderId) -> Result<i64, MarketError> {
-        if let Some(order_ref) = self.orders.as_mut().unwrap().get(&order_id) {
-            order_ref.borrow_mut().status = OrderStatus::Canceled;
-        }
-
         let _ = self.market_depth.cancel_order(order_id);
 
         Ok(0)
@@ -1151,5 +1209,95 @@ mod tests {
         broker.add_data(Some(data));
         broker.elapse(duration + 24 * 3600 * 1000);
         print!("{:?}\n", broker.snapshot());
+    }
+
+    #[test]
+    fn test_process_user_order() {
+        let mut broker: Broker<SkipListMarketDepth> = Broker::new(
+            ExchangeMode::Live,
+            MarketType::SH,
+            "STOCK".to_string(),
+            "CODE".to_string(),
+            0.01,
+            1.0,
+        );
+        broker.init();
+        let timestamp = 20231201093021355;
+        broker.set_current_time(timestamp);
+        // Create and submit a local order
+        let buy_order_ref = Order::new_ref(
+            None,
+            "AAPL".to_string(),
+            timestamp,
+            150.0,
+            10.0,
+            "Buy",
+            OrderType::L,
+            OrderSourceType::UserOrder,
+        );
+        buy_order_ref.borrow_mut().order_id = 1;
+        let sell_order_ref = Order::new_ref(
+            None,
+            "AAPL".to_string(),
+            timestamp,
+            150.0,
+            10.0,
+            "Sell",
+            OrderType::L,
+            OrderSourceType::UserOrder,
+        );
+        sell_order_ref.borrow_mut().order_id = 2;
+        broker.submit_order(buy_order_ref.clone()).unwrap();
+        broker.submit_order(sell_order_ref.clone()).unwrap();
+        // Process the local order
+
+        broker.elapse(1000);
+        broker.sync_order_info();
+
+        // print!("{buy_order_ref:?}\n,{sell_order_ref:?}\n");
+
+        // print!("{:?}\n", broker.market_depth.get_ask_level(2));
+        // print!("{:?}\n", broker.market_depth.get_bid_level(2));
+        // Verify the order status
+        assert_eq!(buy_order_ref.borrow().status, OrderStatus::Filled);
+    }
+
+    #[test]
+    fn test_process_cancel_order() {
+        let mut broker: Broker<SkipListMarketDepth> = Broker::new(
+            ExchangeMode::Live,
+            MarketType::SH,
+            "STOCK".to_string(),
+            "CODE".to_string(),
+            0.01,
+            1.0,
+        );
+        broker.init();
+
+        let timestamp = 20231201093021355;
+        broker.set_current_time(timestamp);
+
+        // Create and submit a limit order
+        let order_ref = Order::new_ref(
+            None,
+            "AAPL".to_string(),
+            timestamp,
+            150.0,
+            10.0,
+            "Buy",
+            OrderType::L,
+            OrderSourceType::UserOrder,
+        );
+        order_ref.borrow_mut().order_id = 1;
+        broker.submit_order(order_ref.clone()).unwrap();
+
+        // Process the order to ensure it is added
+        broker.elapse(1000);
+
+        broker.cancel_order(order_ref.borrow_mut().order_id);
+        // print!("{:?}\n", broker.market_depth.orders);
+        broker.sync_order_info();
+
+        assert_eq!(order_ref.borrow().status, OrderStatus::Canceled);
     }
 }
