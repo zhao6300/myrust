@@ -1,5 +1,6 @@
 pub mod orderbook;
-mod snapshot_helper;
+pub mod snapshot_helper;
+pub mod libpy;
 use std::{
     sync::{mpsc, Arc, Mutex},
     thread,

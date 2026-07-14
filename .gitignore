@@ -1,1 +1,24 @@
+# Rust build artifacts
 /target
+
+# Python build and virtual environment files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+
+# IDE / Editor configuration directories
+.vscode/
+.idea/
+
+# System / OS metadata files
+.DS_Store
+Thumbs.db

@@ -301,7 +301,7 @@ fn thread_test() {
 }
 
 fn web_test() {
-    use hello_cargo::ThreadPool;
+    use trade_mocker_rust::ThreadPool;
     use std::{
         fs,
         io::{prelude::*, BufReader},

@@ -2,9 +2,8 @@ use libc::EEXIST;
 use polars::prelude::DataFrame;
 use polars::prelude::*;
 use pyo3::{self, basic::getattr, prelude::*};
-#[warn(unused_imports)]
-mod depth;
-mod snapshot_helper;
+use crate::orderbook as depth;
+use crate::snapshot_helper;
 use depth::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rayon::result;
